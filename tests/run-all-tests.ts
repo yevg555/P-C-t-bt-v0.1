@@ -1,0 +1,47 @@
+/**
+ * TEST RUNNER
+ * ===========
+ * Runs all tests in sequence
+ * 
+ * Run with: npm test
+ */
+
+import { execSync } from 'child_process';
+import { join } from 'path';
+
+const tests = [
+  { name: 'Position Cache', file: 'position-cache.test.ts' },
+  { name: 'Change Detector', file: 'change-detector.test.ts' },
+];
+
+console.log('╔═══════════════════════════════════════════════════╗');
+console.log('║           RUNNING ALL TESTS                       ║');
+console.log('╚═══════════════════════════════════════════════════╝\n');
+
+let allPassed = true;
+
+for (const test of tests) {
+  console.log(`\n${'═'.repeat(50)}`);
+  console.log(`  Running: ${test.name}`);
+  console.log('═'.repeat(50));
+  
+  try {
+    execSync(`npx ts-node tests/${test.file}`, {
+      cwd: join(__dirname, '..'),
+      stdio: 'inherit',
+    });
+  } catch {
+    allPassed = false;
+  }
+}
+
+console.log('\n' + '═'.repeat(50));
+
+if (allPassed) {
+  console.log('✅ ALL TESTS PASSED!');
+} else {
+  console.log('❌ SOME TESTS FAILED!');
+  process.exit(1);
+}
+
+console.log('═'.repeat(50) + '\n');

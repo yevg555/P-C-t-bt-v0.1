@@ -1,0 +1,35 @@
+{
+  "name": "copy-trading-bot_v2",
+  "version": "1.0.0",
+  "description": "Polymarket copy-trading bot with polling-based trade detection",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "ts-node src/index.ts",
+    "dev": "ts-node-dev --respawn src/index.ts",
+    "test": "ts-node tests/run-all-tests.ts",
+    "test:cache": "ts-node tests/position-cache.test.ts",
+    "test:detector": "ts-node tests/change-detector.test.ts",
+    "test:copysize": "ts-node tests/copy-size.test.ts",
+    "test:api": "ts-node scripts/test-api.ts",
+    "demo:poller": "ts-node scripts/demo-poller.ts",
+    "demo:strategy": "ts-node scripts/demo-strategy.ts"
+  },
+  "keywords": [
+    "polymarket",
+    "copy-trading",
+    "trading-bot"
+  ],
+  "author": "Yevgeny",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "ts-node": "^10.9.2",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.3.0"
+  },
+  "dependencies": {
+    "dotenv": "^16.3.1",
+    "eventemitter3": "^5.0.1"
+  }
+}

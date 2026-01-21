@@ -83,6 +83,12 @@ export interface CopyConfig {
   minOrderSize: number;
   maxPositionPerToken: number;
   maxTotalPosition: number;
+  /** SELL strategy: how to size sells when copying exits */
+  sellStrategy?: SellStrategy;
+  /** Order type: limit (default) or market */
+  orderType?: OrderType;
+  /** Order expiration in seconds (0 = GTC) */
+  orderExpirationSeconds?: number;
 }
 
 export interface RiskConfig {
@@ -114,24 +120,55 @@ export interface ExecutorConfig {
 // ORDER TYPES (Phase 3)
 // ============================================
 
+/**
+ * Order type determines how the order is executed
+ */
+export type OrderType = "limit" | "market";
+
+/**
+ * SELL strategy when copying a trader's exit
+ */
+export type SellStrategy = "proportional" | "full_exit" | "match_delta";
+
+/**
+ * Specification for an order to be executed
+ */
 export interface OrderSpec {
   tokenId: string;
   side: "BUY" | "SELL";
   size: number;
+  /** Limit price (for limit orders) or max/min price (for market orders) */
   price: number;
+  /** Order type: limit (default) or market */
+  orderType?: OrderType;
+  /** Expiration time in milliseconds from now (0 = GTC) */
+  expiresInMs?: number;
+  /** Absolute expiration timestamp */
+  expiresAt?: Date;
+  /** Price offset that was applied (in basis points) */
+  priceOffsetBps?: number;
+  /** The position change that triggered this order */
   triggeredBy?: PositionChange;
 }
 
 export interface OrderResult {
   orderId: string;
-  status: "pending" | "live" | "filled" | "cancelled" | "failed";
+  status: "pending" | "live" | "filled" | "partial" | "expired" | "cancelled" | "failed";
   filledSize: number;
+  /** Remaining unfilled size (for partial fills) */
+  remainingSize?: number;
   avgFillPrice?: number;
   error?: string;
-  /** Timestamp when the order was executed */
+  /** Timestamp when the order was placed */
+  placedAt?: Date;
+  /** Timestamp when the order was executed/completed */
   executedAt: Date;
   /** Which mode executed this order */
   executionMode: TradingMode;
+  /** Was this order a limit or market order */
+  orderType?: OrderType;
+  /** Did the order expire? */
+  expired?: boolean;
 }
 
 /**

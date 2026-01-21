@@ -160,7 +160,8 @@ export class PaperTradingExecutor implements OrderExecutor {
     };
     this.portfolio.trades.push(trade);
 
-    console.log(`[PAPER] BUY FILLED: ${size} shares @ $${price.toFixed(4)} = $${cost.toFixed(2)}`);
+    const orderType = order.orderType || "limit";
+    console.log(`[PAPER] BUY FILLED (${orderType}): ${size} shares @ $${price.toFixed(4)} = $${cost.toFixed(2)}`);
     console.log(`[PAPER] Balance: $${this.portfolio.balance.toFixed(2)}`);
 
     return {
@@ -168,8 +169,10 @@ export class PaperTradingExecutor implements OrderExecutor {
       status: "filled",
       filledSize: size,
       avgFillPrice: price,
+      placedAt: executedAt,
       executedAt,
       executionMode: "paper",
+      orderType,
     };
   }
 
@@ -229,8 +232,9 @@ export class PaperTradingExecutor implements OrderExecutor {
     };
     this.portfolio.trades.push(trade);
 
+    const orderType = order.orderType || "limit";
     const pnlSign = tradePnL >= 0 ? "+" : "";
-    console.log(`[PAPER] SELL FILLED: ${sellSize} shares @ $${price.toFixed(4)} = $${proceeds.toFixed(2)} (${pnlSign}$${tradePnL.toFixed(2)})`);
+    console.log(`[PAPER] SELL FILLED (${orderType}): ${sellSize} shares @ $${price.toFixed(4)} = $${proceeds.toFixed(2)} (${pnlSign}$${tradePnL.toFixed(2)})`);
     console.log(`[PAPER] Balance: $${this.portfolio.balance.toFixed(2)} | Total P&L: ${pnlSign}$${this.portfolio.totalPnL.toFixed(2)}`);
 
     return {
@@ -238,8 +242,10 @@ export class PaperTradingExecutor implements OrderExecutor {
       status: "filled",
       filledSize: sellSize,
       avgFillPrice: price,
+      placedAt: executedAt,
       executedAt,
       executionMode: "paper",
+      orderType,
     };
   }
 

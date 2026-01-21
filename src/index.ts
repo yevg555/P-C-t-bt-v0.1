@@ -24,7 +24,7 @@ import {
   getTradingMode,
   PaperTradingExecutor,
 } from "./execution";
-import { PositionChange, OrderSpec, OrderExecutor } from "./types";
+import { PositionChange, OrderSpec, OrderExecutor, SellStrategy, OrderType } from "./types";
 
 // Load environment variables
 dotenv.config();
@@ -90,6 +90,10 @@ class CopyTradingBot {
         process.env.MAX_POSITION_PER_TOKEN || "1000"
       ),
       maxTotalPosition: 5000,
+      // SELL and order configuration
+      sellStrategy: (process.env.SELL_STRATEGY as SellStrategy) || "proportional",
+      orderType: (process.env.ORDER_TYPE as OrderType) || "limit",
+      orderExpirationSeconds: parseInt(process.env.ORDER_EXPIRATION_SECONDS || "30"),
     });
 
     this.riskChecker = new RiskChecker({
@@ -150,8 +154,11 @@ class CopyTradingBot {
     }
     console.log("=".repeat(60));
 
+    // Get our current position in this token (needed for SELL calculations)
+    const yourPosition = await this.executor.getPosition(change.tokenId);
+
     // Step 1: Should we copy this trade?
-    const shouldCopy = this.sizeCalculator.shouldCopy(change);
+    const shouldCopy = this.sizeCalculator.shouldCopy(change, yourPosition);
     if (!shouldCopy.copy) {
       console.log(`[SKIP] ${shouldCopy.reason}`);
       return;
@@ -180,6 +187,7 @@ class CopyTradingBot {
       change,
       currentPrice,
       yourBalance: balance,
+      yourPosition,
     });
 
     console.log(`[SIZE] ${sizeResult.reason}`);
@@ -202,13 +210,22 @@ class CopyTradingBot {
     console.log(`[PRICE] ${priceDetails.description}`);
 
     // Step 5: Create order spec
+    const orderConfig = this.sizeCalculator.getOrderConfig();
+    const expiresInMs = orderConfig.expirationSeconds * 1000;
+
     const order: OrderSpec = {
       tokenId: change.tokenId,
       side: change.side,
       size: sizeResult.shares,
       price: adjustedPrice,
+      orderType: orderConfig.orderType,
+      expiresInMs: expiresInMs > 0 ? expiresInMs : undefined,
+      expiresAt: expiresInMs > 0 ? new Date(Date.now() + expiresInMs) : undefined,
+      priceOffsetBps: orderConfig.priceOffsetBps,
       triggeredBy: change,
     };
+
+    console.log(`[ORDER] Type: ${order.orderType?.toUpperCase()}, Expires: ${order.expiresInMs ? `${orderConfig.expirationSeconds}s` : 'GTC'}`);
 
     // Step 6: Risk check
     const tradingState = await this.getTradingState();
@@ -287,11 +304,16 @@ class CopyTradingBot {
     console.log("║          POLYMARKET COPY TRADING BOT v1.0                 ║");
     console.log("╚═══════════════════════════════════════════════════════════╝");
     console.log("");
+    const orderConfig = this.sizeCalculator.getOrderConfig();
     console.log(`  Mode:            ${getTradingMode().toUpperCase()}`);
     console.log(`  Trader:          ${process.env.TRADER_ADDRESS?.slice(0, 10)}...`);
     console.log(`  Poll Interval:   ${process.env.POLLING_INTERVAL_MS || 1000}ms`);
     console.log(`  Sizing:          ${process.env.SIZING_METHOD || "proportional_to_portfolio"}`);
     console.log(`  Portfolio %:     ${(parseFloat(process.env.PORTFOLIO_PERCENTAGE || "0.05") * 100).toFixed(1)}%`);
+    console.log(`  SELL Strategy:   ${process.env.SELL_STRATEGY || "proportional"}`);
+    console.log(`  Order Type:      ${orderConfig.orderType.toUpperCase()}`);
+    console.log(`  Order Expiry:    ${orderConfig.expirationSeconds > 0 ? `${orderConfig.expirationSeconds}s` : 'GTC'}`);
+    console.log(`  Price Offset:    ${orderConfig.priceOffsetBps} bps (${(orderConfig.priceOffsetBps / 100).toFixed(2)}%)`);
     console.log(`  Starting Balance: $${(await this.executor.getBalance()).toFixed(2)}`);
     console.log("");
 

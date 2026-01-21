@@ -91,6 +91,26 @@ export interface RiskConfig {
 }
 
 // ============================================
+// TRADING MODE TYPES
+// ============================================
+
+/**
+ * Trading mode determines how orders are executed
+ * - paper: Simulated trading for testing (no real money)
+ * - live: Real trading with actual funds
+ */
+export type TradingMode = "paper" | "live";
+
+/**
+ * Configuration for the trading executor
+ */
+export interface ExecutorConfig {
+  mode: TradingMode;
+  /** Starting balance for paper trading */
+  paperBalance?: number;
+}
+
+// ============================================
 // ORDER TYPES (Phase 3)
 // ============================================
 
@@ -106,7 +126,70 @@ export interface OrderResult {
   orderId: string;
   status: "pending" | "live" | "filled" | "cancelled" | "failed";
   filledSize: number;
+  avgFillPrice?: number;
   error?: string;
+  /** Timestamp when the order was executed */
+  executedAt: Date;
+  /** Which mode executed this order */
+  executionMode: TradingMode;
+}
+
+/**
+ * A paper trade record for tracking simulated trades
+ */
+export interface PaperTrade {
+  orderId: string;
+  tokenId: string;
+  marketId?: string;
+  side: "BUY" | "SELL";
+  size: number;
+  price: number;
+  cost: number;
+  executedAt: Date;
+}
+
+/**
+ * Paper trading portfolio state
+ */
+export interface PaperPortfolio {
+  balance: number;
+  initialBalance: number;
+  positions: Map<string, PaperPosition>;
+  trades: PaperTrade[];
+  totalPnL: number;
+}
+
+/**
+ * A paper position (simulated holding)
+ */
+export interface PaperPosition {
+  tokenId: string;
+  quantity: number;
+  avgPrice: number;
+  totalCost: number;
+}
+
+/**
+ * Interface that all order executors must implement
+ */
+export interface OrderExecutor {
+  /** Execute an order */
+  execute(order: OrderSpec): Promise<OrderResult>;
+
+  /** Get current balance */
+  getBalance(): Promise<number>;
+
+  /** Get position for a token (0 if none) */
+  getPosition(tokenId: string): Promise<number>;
+
+  /** Get all positions */
+  getAllPositions(): Promise<Map<string, number>>;
+
+  /** Get the trading mode */
+  getMode(): TradingMode;
+
+  /** Check if executor is ready to trade */
+  isReady(): Promise<boolean>;
 }
 
 // ============================================

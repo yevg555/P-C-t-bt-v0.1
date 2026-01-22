@@ -250,6 +250,9 @@ export class PaperTradingExecutor implements OrderExecutor {
       this.portfolio.positions.delete(order.tokenId);
     }
 
+    // Update total holdings value after sell
+    this.updateTotalHoldingsValue();
+
     // Record trade
     const trade: PaperTrade = {
       orderId,

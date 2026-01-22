@@ -14,6 +14,7 @@ const tests = [
   { name: 'Change Detector', file: 'change-detector.test.ts' },
   { name: 'Copy Size Calculator', file: 'copy-size.test.ts' },
   { name: 'Paper Trading Executor', file: 'paper-executor.test.ts' },
+  { name: 'TP/SL Monitor', file: 'tp-sl-monitor.test.ts' },
 ];
 
 console.log('╔═══════════════════════════════════════════════════╗');

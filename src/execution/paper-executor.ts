@@ -19,6 +19,7 @@ import {
   PaperPortfolio,
   PaperPosition,
   PaperTrade,
+  SpendTracker,
 } from "../types";
 
 /**
@@ -46,6 +47,9 @@ export class PaperTradingExecutor implements OrderExecutor {
   private portfolio: PaperPortfolio;
   private config: PaperExecutorConfig;
   private orderCounter: number = 0;
+  private spendTracker: SpendTracker;
+  /** Maps tokenId to marketId for spend tracking */
+  private tokenToMarket: Map<string, string> = new Map();
 
   constructor(config: Partial<PaperExecutorConfig> = {}) {
     this.config = { ...DEFAULT_CONFIG, ...config };
@@ -56,6 +60,12 @@ export class PaperTradingExecutor implements OrderExecutor {
       positions: new Map(),
       trades: [],
       totalPnL: 0,
+    };
+
+    this.spendTracker = {
+      tokenSpend: new Map(),
+      marketSpend: new Map(),
+      totalHoldingsValue: 0,
     };
 
     console.log(`[PAPER] Initialized with $${this.config.initialBalance} balance`);
@@ -139,14 +149,34 @@ export class PaperTradingExecutor implements OrderExecutor {
       existing.totalCost = totalCost;
       existing.avgPrice = totalCost / totalQuantity;
     } else {
-      // New position
+      // New position - track entry price for TP/SL
+      const marketId = order.triggeredBy?.marketId;
       this.portfolio.positions.set(order.tokenId, {
         tokenId: order.tokenId,
         quantity: size,
         avgPrice: price,
         totalCost: cost,
+        marketId,
+        entryPrice: price,
+        openedAt: new Date(),
       });
+      if (marketId) {
+        this.tokenToMarket.set(order.tokenId, marketId);
+      }
     }
+
+    // Update spend tracking
+    const currentTokenSpend = this.spendTracker.tokenSpend.get(order.tokenId) || 0;
+    this.spendTracker.tokenSpend.set(order.tokenId, currentTokenSpend + cost);
+
+    const marketId = order.triggeredBy?.marketId || this.tokenToMarket.get(order.tokenId);
+    if (marketId) {
+      const currentMarketSpend = this.spendTracker.marketSpend.get(marketId) || 0;
+      this.spendTracker.marketSpend.set(marketId, currentMarketSpend + cost);
+    }
+
+    // Update total holdings value
+    this.updateTotalHoldingsValue();
 
     // Record trade
     const trade: PaperTrade = {
@@ -406,7 +436,110 @@ export class PaperTradingExecutor implements OrderExecutor {
       trades: [],
       totalPnL: 0,
     };
+    this.spendTracker = {
+      tokenSpend: new Map(),
+      marketSpend: new Map(),
+      totalHoldingsValue: 0,
+    };
+    this.tokenToMarket.clear();
     this.orderCounter = 0;
     console.log(`[PAPER] Reset to $${this.config.initialBalance} balance`);
+  }
+
+  /**
+   * Update total holdings value based on current positions
+   */
+  private updateTotalHoldingsValue(): void {
+    let total = 0;
+    for (const position of this.portfolio.positions.values()) {
+      total += position.totalCost;
+    }
+    this.spendTracker.totalHoldingsValue = total;
+  }
+
+  /**
+   * Get spend tracker for risk checks
+   */
+  getSpendTracker(): SpendTracker {
+    return {
+      tokenSpend: new Map(this.spendTracker.tokenSpend),
+      marketSpend: new Map(this.spendTracker.marketSpend),
+      totalHoldingsValue: this.spendTracker.totalHoldingsValue,
+    };
+  }
+
+  /**
+   * Get all position details (for TP/SL monitoring)
+   */
+  async getAllPositionDetails(): Promise<Map<string, PaperPosition>> {
+    return new Map(this.portfolio.positions);
+  }
+
+  /**
+   * Get token spend for a specific token
+   */
+  getTokenSpend(tokenId: string): number {
+    return this.spendTracker.tokenSpend.get(tokenId) || 0;
+  }
+
+  /**
+   * Get market spend for a specific market
+   */
+  getMarketSpend(marketId: string): number {
+    return this.spendTracker.marketSpend.get(marketId) || 0;
+  }
+
+  /**
+   * Sell all positions immediately (1-Click Sell / Kill Switch)
+   */
+  async sellAllPositions(currentPrices: Map<string, number>): Promise<OrderResult[]> {
+    const results: OrderResult[] = [];
+    const positions = Array.from(this.portfolio.positions.entries());
+
+    if (positions.length === 0) {
+      console.log("[PAPER] No positions to sell");
+      return results;
+    }
+
+    console.log(`\n${"!".repeat(50)}`);
+    console.log("!!! 1-CLICK SELL ACTIVATED - SELLING ALL POSITIONS !!!");
+    console.log(`${"!".repeat(50)}\n`);
+
+    for (const [tokenId, position] of positions) {
+      const price = currentPrices.get(tokenId) || position.avgPrice;
+
+      const order: OrderSpec = {
+        tokenId,
+        side: "SELL",
+        size: position.quantity,
+        price,
+        orderType: "market",
+      };
+
+      try {
+        const result = await this.execute(order);
+        results.push(result);
+      } catch (error) {
+        console.error(`[PAPER] Failed to sell ${tokenId}: ${error}`);
+        results.push({
+          orderId: `FAILED-${tokenId}`,
+          status: "failed",
+          filledSize: 0,
+          error: String(error),
+          executedAt: new Date(),
+          executionMode: "paper",
+        });
+      }
+    }
+
+    console.log(`\n[PAPER] 1-Click Sell Complete: ${results.filter(r => r.status === "filled").length}/${positions.length} positions closed\n`);
+    return results;
+  }
+
+  /**
+   * Set token to market mapping (for spend tracking)
+   */
+  setTokenMarket(tokenId: string, marketId: string): void {
+    this.tokenToMarket.set(tokenId, marketId);
   }
 }

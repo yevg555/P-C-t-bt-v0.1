@@ -12,7 +12,7 @@
  * This is your safety net!
  */
 
-import { RiskConfig, OrderSpec } from '../types';
+import { RiskConfig, OrderSpec, SpendTracker } from '../types';
 
 /**
  * Current state of your trading
@@ -20,18 +20,21 @@ import { RiskConfig, OrderSpec } from '../types';
 export interface TradingState {
   /** Today's realized P&L */
   dailyPnL: number;
-  
+
   /** Total realized P&L since start */
   totalPnL: number;
-  
+
   /** Current balance in USD */
   balance: number;
-  
+
   /** Current positions: tokenId -> quantity */
   positions: Map<string, number>;
-  
+
   /** Total shares across all positions */
   totalShares: number;
+
+  /** Spend tracking for tokens and markets */
+  spendTracker?: SpendTracker;
 }
 
 /**
@@ -57,6 +60,9 @@ export interface RiskCheckResult {
 export const DEFAULT_RISK_CONFIG: RiskConfig = {
   maxDailyLoss: 100,   // Stop if down $100 today
   maxTotalLoss: 500,   // Kill switch at $500 total loss
+  maxTokenSpend: 0,    // 0 = unlimited
+  maxMarketSpend: 0,   // 0 = unlimited
+  totalHoldingsLimit: 0, // 0 = unlimited
 };
 
 export class RiskChecker {
@@ -117,6 +123,54 @@ export class RiskChecker {
         warnings: [],
         riskLevel: 'medium',
       };
+    }
+
+    // === SPENDING LIMITS (only for BUY orders) ===
+    if (order.side === 'BUY' && state.spendTracker) {
+      // Check max token spend
+      if (this.config.maxTokenSpend && this.config.maxTokenSpend > 0) {
+        const currentTokenSpend = state.spendTracker.tokenSpend.get(order.tokenId) || 0;
+        const newTokenSpend = currentTokenSpend + orderCost;
+
+        if (newTokenSpend > this.config.maxTokenSpend) {
+          return {
+            approved: false,
+            reason: `Max token spend exceeded: $${currentTokenSpend.toFixed(2)} + $${orderCost.toFixed(2)} > $${this.config.maxTokenSpend}`,
+            warnings: [],
+            riskLevel: 'medium',
+          };
+        }
+      }
+
+      // Check max market spend
+      if (this.config.maxMarketSpend && this.config.maxMarketSpend > 0 && order.triggeredBy?.marketId) {
+        const marketId = order.triggeredBy.marketId;
+        const currentMarketSpend = state.spendTracker.marketSpend.get(marketId) || 0;
+        const newMarketSpend = currentMarketSpend + orderCost;
+
+        if (newMarketSpend > this.config.maxMarketSpend) {
+          return {
+            approved: false,
+            reason: `Max market spend exceeded: $${currentMarketSpend.toFixed(2)} + $${orderCost.toFixed(2)} > $${this.config.maxMarketSpend}`,
+            warnings: [],
+            riskLevel: 'medium',
+          };
+        }
+      }
+
+      // Check total holdings limit
+      if (this.config.totalHoldingsLimit && this.config.totalHoldingsLimit > 0) {
+        const newTotalHoldings = state.spendTracker.totalHoldingsValue + orderCost;
+
+        if (newTotalHoldings > this.config.totalHoldingsLimit) {
+          return {
+            approved: false,
+            reason: `Total holdings limit exceeded: $${state.spendTracker.totalHoldingsValue.toFixed(2)} + $${orderCost.toFixed(2)} > $${this.config.totalHoldingsLimit}`,
+            warnings: [],
+            riskLevel: 'medium',
+          };
+        }
+      }
     }
     
     // === POSITION SIZE CHECK ===

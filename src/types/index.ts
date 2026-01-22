@@ -73,6 +73,11 @@ export interface PollerConfig {
   maxConsecutiveErrors: number;
 }
 
+/**
+ * Action to take when calculated trade amount is below minimum
+ */
+export type BelowMinLimitAction = "buy_at_min" | "skip";
+
 export interface CopyConfig {
   sizingMethod:
     | "proportional_to_portfolio"
@@ -89,11 +94,41 @@ export interface CopyConfig {
   orderType?: OrderType;
   /** Order expiration in seconds (0 = GTC) */
   orderExpirationSeconds?: number;
+  /** Action when calculated trade is below minimum: buy_at_min or skip */
+  belowMinLimitAction?: BelowMinLimitAction;
 }
 
 export interface RiskConfig {
   maxDailyLoss: number;
   maxTotalLoss: number;
+  /** Maximum amount to spend per token (not market) */
+  maxTokenSpend?: number;
+  /** Maximum amount to spend per market (includes all tokens in market) */
+  maxMarketSpend?: number;
+  /** Stop buying when total holdings value exceeds this */
+  totalHoldingsLimit?: number;
+}
+
+/**
+ * Auto TP/SL configuration
+ */
+export interface AutoTpSlConfig {
+  /** Enable auto TP/SL feature */
+  enabled: boolean;
+  /** Take profit percentage from entry price (e.g., 0.10 = 10%) */
+  takeProfitPercent?: number;
+  /** Stop loss percentage from entry price (e.g., 0.05 = 5%) */
+  stopLossPercent?: number;
+}
+
+/**
+ * Wallet/Trader configuration with tagging
+ */
+export interface TraderConfig {
+  /** Wallet address to copy */
+  address: string;
+  /** Friendly name/tag for the trader */
+  tag?: string;
 }
 
 // ============================================
@@ -204,6 +239,24 @@ export interface PaperPosition {
   quantity: number;
   avgPrice: number;
   totalCost: number;
+  /** Market ID this token belongs to */
+  marketId?: string;
+  /** Entry price for the initial position (for TP/SL calculation) */
+  entryPrice?: number;
+  /** Timestamp when position was opened */
+  openedAt?: Date;
+}
+
+/**
+ * Spend tracking for tokens and markets
+ */
+export interface SpendTracker {
+  /** Total spent per token: tokenId -> USD amount */
+  tokenSpend: Map<string, number>;
+  /** Total spent per market: marketId -> USD amount */
+  marketSpend: Map<string, number>;
+  /** Total holdings value */
+  totalHoldingsValue: number;
 }
 
 /**
@@ -227,6 +280,15 @@ export interface OrderExecutor {
 
   /** Check if executor is ready to trade */
   isReady(): Promise<boolean>;
+
+  /** Get all position details (for TP/SL monitoring) */
+  getAllPositionDetails?(): Promise<Map<string, PaperPosition>>;
+
+  /** Get spend tracker */
+  getSpendTracker?(): SpendTracker;
+
+  /** Sell all positions (1-Click Sell) */
+  sellAllPositions?(currentPrices: Map<string, number>): Promise<OrderResult[]>;
 }
 
 // ============================================

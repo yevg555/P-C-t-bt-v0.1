@@ -121,11 +121,12 @@ test('Caps at maxPositionPerToken', () => {
   assert(result.adjustments.length > 0, 'Should have adjustment note');
 });
 
-test('Skips orders below minOrderSize', () => {
+test('Skips orders below minOrderSize (when belowMinLimitAction is skip)', () => {
   const calc = new CopySizeCalculator({
     sizingMethod: 'proportional_to_portfolio',
     portfolioPercentage: 0.01, // 1%
     minOrderSize: 100,
+    belowMinLimitAction: 'skip', // Explicitly set to skip
   });
 
   const result = calc.calculate({
@@ -368,6 +369,86 @@ test('shouldCopy returns false for tiny changes', () => {
   const calc = new CopySizeCalculator();
   const result = calc.shouldCopy(makeChange(0.5, 'BUY'));
   assert(result.copy === false, 'Should not copy tiny change');
+});
+
+// ============================================
+// BELOW MIN LIMIT ACTION TESTS
+// ============================================
+
+console.log('\n--- Below Min Limit Action Tests ---');
+
+test('belowMinLimitAction: buy_at_min - buys at minimum when below threshold', () => {
+  const calc = new CopySizeCalculator({
+    sizingMethod: 'proportional_to_portfolio',
+    portfolioPercentage: 0.01, // 1% = small trade
+    minOrderSize: 10,
+    belowMinLimitAction: 'buy_at_min',
+  });
+
+  const result = calc.calculate({
+    change: makeChange(50),
+    currentPrice: 0.50,
+    yourBalance: 100, // 1% = $1, at $0.50 = 2 shares (below min of 10)
+  });
+
+  // With buy_at_min, should round up to minimum 10 shares
+  assert(result.shares === 10, `Should buy at min 10, got ${result.shares}`);
+  assert(result.adjustments.some(a => a.includes('buying at min')), 'Should note buying at min');
+});
+
+test('belowMinLimitAction: skip - skips when below threshold', () => {
+  const calc = new CopySizeCalculator({
+    sizingMethod: 'proportional_to_portfolio',
+    portfolioPercentage: 0.01, // 1%
+    minOrderSize: 10,
+    belowMinLimitAction: 'skip',
+  });
+
+  const result = calc.calculate({
+    change: makeChange(50),
+    currentPrice: 0.50,
+    yourBalance: 100, // 1% = $1, at $0.50 = 2 shares (below min of 10)
+  });
+
+  // With skip, should return 0
+  assert(result.shares === 0, `Should skip (0 shares), got ${result.shares}`);
+  assert(result.adjustments.some(a => a.includes('skipping')), 'Should note skipping');
+});
+
+test('belowMinLimitAction: uses Polymarket minimum of 5 shares', () => {
+  const calc = new CopySizeCalculator({
+    sizingMethod: 'proportional_to_portfolio',
+    portfolioPercentage: 0.01,
+    minOrderSize: 3, // Even if set lower than 5
+    belowMinLimitAction: 'buy_at_min',
+  });
+
+  const result = calc.calculate({
+    change: makeChange(50),
+    currentPrice: 0.50,
+    yourBalance: 100, // Would calculate ~2 shares
+  });
+
+  // Should use at least 5 (Polymarket minimum)
+  assert(result.shares >= 5, `Should be at least 5 (Polymarket min), got ${result.shares}`);
+});
+
+test('belowMinLimitAction: does not affect trades already above minimum', () => {
+  const calc = new CopySizeCalculator({
+    sizingMethod: 'proportional_to_portfolio',
+    portfolioPercentage: 0.10, // 10%
+    minOrderSize: 10,
+    belowMinLimitAction: 'buy_at_min',
+  });
+
+  const result = calc.calculate({
+    change: makeChange(100),
+    currentPrice: 0.50,
+    yourBalance: 1000, // 10% = $100, at $0.50 = 200 shares (above min)
+  });
+
+  // Should calculate normally, not be affected by buy_at_min
+  assertClose(result.shares, 200, 1, 'Should calculate 200 shares normally');
 });
 
 // ============================================

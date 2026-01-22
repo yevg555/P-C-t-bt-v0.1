@@ -308,6 +308,152 @@ async function runTests() {
     assert(result.avgFillPrice === 0.65, `Expected 0.65, got ${result.avgFillPrice}`);
   });
 
+  // === Spend Tracking Tests ===
+
+  console.log("\n--- Spend Tracking Tests ---");
+
+  await test("Tracks token spend correctly", async () => {
+    const executor = new PaperTradingExecutor({ initialBalance: 1000 });
+
+    // Buy 100 @ $0.50 = $50 spent on token-a
+    await executor.execute(makeOrder("BUY", 100, 0.5, "token-a"));
+    // Buy 50 @ $0.40 = $20 spent on token-a
+    await executor.execute(makeOrder("BUY", 50, 0.4, "token-a"));
+
+    const tokenSpend = executor.getTokenSpend("token-a");
+    assertClose(tokenSpend, 70, 0.01, "Token spend should be $70");
+  });
+
+  await test("getSpendTracker returns all spend data", async () => {
+    const executor = new PaperTradingExecutor({ initialBalance: 1000 });
+
+    await executor.execute(makeOrder("BUY", 100, 0.5, "token-x"));
+    await executor.execute(makeOrder("BUY", 50, 0.4, "token-y"));
+
+    const tracker = executor.getSpendTracker();
+
+    assert(tracker.tokenSpend.get("token-x") === 50, "Token X spend should be $50");
+    assert(tracker.tokenSpend.get("token-y") === 20, "Token Y spend should be $20");
+    assertClose(tracker.totalHoldingsValue, 70, 0.01, "Total holdings should be $70");
+  });
+
+  await test("Total holdings value updates correctly", async () => {
+    const executor = new PaperTradingExecutor({ initialBalance: 1000 });
+
+    await executor.execute(makeOrder("BUY", 100, 0.5, "token-holdings"));
+    let tracker = executor.getSpendTracker();
+    assertClose(tracker.totalHoldingsValue, 50, 0.01, "Holdings should be $50 after buy");
+
+    // Sell half
+    await executor.execute(makeOrder("SELL", 50, 0.6, "token-holdings"));
+    tracker = executor.getSpendTracker();
+    assertClose(tracker.totalHoldingsValue, 25, 0.01, "Holdings should be $25 after partial sell");
+  });
+
+  // === Position Details Tests ===
+
+  console.log("\n--- Position Details Tests ---");
+
+  await test("getAllPositionDetails returns full position info", async () => {
+    const executor = new PaperTradingExecutor({ initialBalance: 1000 });
+
+    await executor.execute(makeOrder("BUY", 100, 0.5, "token-details"));
+
+    const positions = await executor.getAllPositionDetails();
+    const position = positions.get("token-details");
+
+    assert(position !== undefined, "Position should exist");
+    assert(position!.quantity === 100, "Quantity should be 100");
+    assert(position!.avgPrice === 0.5, "Avg price should be 0.5");
+    assert(position!.entryPrice === 0.5, "Entry price should be 0.5");
+    assert(position!.openedAt !== undefined, "Should have openedAt timestamp");
+  });
+
+  await test("Entry price stays constant when averaging in", async () => {
+    const executor = new PaperTradingExecutor({ initialBalance: 1000 });
+
+    // First buy
+    await executor.execute(makeOrder("BUY", 100, 0.4, "token-entry"));
+    const positions1 = await executor.getAllPositionDetails();
+    const entryPrice1 = positions1.get("token-entry")!.entryPrice;
+
+    // Second buy at different price
+    await executor.execute(makeOrder("BUY", 100, 0.6, "token-entry"));
+    const positions2 = await executor.getAllPositionDetails();
+    const position = positions2.get("token-entry")!;
+
+    // Entry price should stay the same (first trade price)
+    assert(position.entryPrice === entryPrice1, "Entry price should not change");
+    // But avg price should update
+    assertClose(position.avgPrice, 0.5, 0.01, "Avg price should be average");
+  });
+
+  // === 1-Click Sell Tests ===
+
+  console.log("\n--- 1-Click Sell Tests ---");
+
+  await test("sellAllPositions sells all positions", async () => {
+    const executor = new PaperTradingExecutor({ initialBalance: 1000 });
+
+    await executor.execute(makeOrder("BUY", 100, 0.5, "token-1"));
+    await executor.execute(makeOrder("BUY", 50, 0.4, "token-2"));
+    await executor.execute(makeOrder("BUY", 75, 0.6, "token-3"));
+
+    const prices = new Map<string, number>([
+      ["token-1", 0.55],
+      ["token-2", 0.45],
+      ["token-3", 0.65],
+    ]);
+
+    const results = await executor.sellAllPositions(prices);
+
+    assert(results.length === 3, `Expected 3 sell results, got ${results.length}`);
+    assert(results.every(r => r.status === "filled"), "All should be filled");
+
+    const positions = await executor.getAllPositions();
+    assert(positions.size === 0, "All positions should be closed");
+  });
+
+  await test("sellAllPositions returns empty array when no positions", async () => {
+    const executor = new PaperTradingExecutor({ initialBalance: 1000 });
+
+    const results = await executor.sellAllPositions(new Map());
+
+    assert(results.length === 0, "Should return empty array");
+  });
+
+  await test("sellAllPositions uses avgPrice as fallback when no price provided", async () => {
+    const executor = new PaperTradingExecutor({ initialBalance: 1000 });
+
+    await executor.execute(makeOrder("BUY", 100, 0.5, "token-fallback"));
+
+    // Don't provide a price for the token
+    const results = await executor.sellAllPositions(new Map());
+
+    assert(results.length === 1, "Should have 1 result");
+    assert(results[0].status === "filled", "Should be filled");
+    assert(results[0].avgFillPrice === 0.5, "Should use avgPrice as fallback");
+  });
+
+  // === Reset Tests (extended) ===
+
+  console.log("\n--- Reset Tests (extended) ---");
+
+  await test("reset() clears spend tracker", async () => {
+    const executor = new PaperTradingExecutor({ initialBalance: 500 });
+
+    await executor.execute(makeOrder("BUY", 100, 0.5, "reset-spend"));
+
+    const trackerBefore = executor.getSpendTracker();
+    assert(trackerBefore.totalHoldingsValue > 0, "Should have holdings before reset");
+
+    executor.reset();
+
+    const trackerAfter = executor.getSpendTracker();
+    assert(trackerAfter.totalHoldingsValue === 0, "Holdings should be 0 after reset");
+    assert(trackerAfter.tokenSpend.size === 0, "Token spend should be cleared");
+  });
+
   // === Summary ===
   console.log("\n" + "─".repeat(40));
   console.log(`Results: ${passed} passed, ${failed} failed`);

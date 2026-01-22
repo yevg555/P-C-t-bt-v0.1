@@ -37,6 +37,23 @@ interface OrderBookResponse {
 }
 
 /**
+ * Portfolio value response from the API
+ */
+interface PortfolioValueResponse {
+  value?: string | number;
+  total?: string | number;
+  portfolio_value?: string | number;
+}
+
+/**
+ * Cached portfolio value with timestamp
+ */
+interface CachedPortfolioValue {
+  value: number;
+  timestamp: number;
+}
+
+/**
  * Raw trade/activity response from the API
  */
 export interface RawTradeResponse {
@@ -84,6 +101,11 @@ export class PolymarketAPI {
   private lastRequestTime = 0;
   private minRequestInterval = 67; // ~15 requests/sec max
 
+  // Portfolio value cache: address -> cached value
+  private portfolioValueCache: Map<string, CachedPortfolioValue> = new Map();
+  // Cache TTL in milliseconds (default 30 seconds)
+  private portfolioValueCacheTtlMs: number = 30000;
+
   // ===================================
   // POSITIONS (Data API)
   // ===================================
@@ -118,6 +140,128 @@ export class PolymarketAPI {
       }
       throw error;
     }
+  }
+
+  // ===================================
+  // PORTFOLIO VALUE (Data API)
+  // ===================================
+
+  /**
+   * Get total portfolio value for a wallet address
+   * Uses caching to reduce API calls and latency
+   *
+   * @param address - Wallet address
+   * @param options - Options for fetching
+   * @param options.forceRefresh - Bypass cache and fetch fresh value
+   * @returns Total portfolio value in USD
+   *
+   * @example
+   * const value = await api.getPortfolioValue(traderAddress);
+   * console.log(`Trader portfolio: $${value}`);
+   */
+  async getPortfolioValue(
+    address: string,
+    options: { forceRefresh?: boolean } = {}
+  ): Promise<number> {
+    const { forceRefresh = false } = options;
+
+    // Check cache first (unless force refresh)
+    if (!forceRefresh) {
+      const cached = this.portfolioValueCache.get(address);
+      if (cached && Date.now() - cached.timestamp < this.portfolioValueCacheTtlMs) {
+        return cached.value;
+      }
+    }
+
+    await this.respectRateLimit();
+
+    const url = `${this.dataApiUrl}/value?user=${address}`;
+
+    try {
+      const response = await fetch(url, {
+        method: "GET",
+        headers: { Accept: "application/json" },
+      });
+
+      if (!response.ok) {
+        if (response.status === 429) {
+          throw new Error("RATE_LIMITED: Too many requests");
+        }
+        throw new Error(`API_ERROR: ${response.status} ${response.statusText}`);
+      }
+
+      const data = (await response.json()) as PortfolioValueResponse;
+
+      // Parse value from response (handle different field names)
+      const rawValue = data.value ?? data.total ?? data.portfolio_value ?? 0;
+      const value = typeof rawValue === "string" ? parseFloat(rawValue) : rawValue;
+
+      // Cache the result
+      this.portfolioValueCache.set(address, {
+        value,
+        timestamp: Date.now(),
+      });
+
+      return value;
+    } catch (error) {
+      if (error instanceof Error) {
+        console.error(`[API] getPortfolioValue error: ${error.message}`);
+      }
+
+      // Return cached value if available (even if stale)
+      const cached = this.portfolioValueCache.get(address);
+      if (cached) {
+        console.warn(`[API] Using stale cached portfolio value for ${address.slice(0, 10)}...`);
+        return cached.value;
+      }
+
+      throw error;
+    }
+  }
+
+  /**
+   * Get portfolio value with pre-fetching for reduced latency
+   * Call this periodically to keep cache warm
+   *
+   * @param address - Wallet address
+   */
+  async prefetchPortfolioValue(address: string): Promise<void> {
+    try {
+      await this.getPortfolioValue(address, { forceRefresh: true });
+    } catch (error) {
+      // Silently fail for prefetch - cache will be used as fallback
+      console.warn(`[API] Prefetch portfolio value failed: ${error}`);
+    }
+  }
+
+  /**
+   * Set portfolio value cache TTL
+   *
+   * @param ttlMs - Cache TTL in milliseconds
+   */
+  setPortfolioValueCacheTtl(ttlMs: number): void {
+    this.portfolioValueCacheTtlMs = ttlMs;
+  }
+
+  /**
+   * Get cached portfolio value (if available)
+   * Returns undefined if not cached or cache is stale
+   *
+   * @param address - Wallet address
+   */
+  getCachedPortfolioValue(address: string): number | undefined {
+    const cached = this.portfolioValueCache.get(address);
+    if (cached && Date.now() - cached.timestamp < this.portfolioValueCacheTtlMs) {
+      return cached.value;
+    }
+    return undefined;
+  }
+
+  /**
+   * Clear portfolio value cache
+   */
+  clearPortfolioValueCache(): void {
+    this.portfolioValueCache.clear();
   }
 
   // ===================================

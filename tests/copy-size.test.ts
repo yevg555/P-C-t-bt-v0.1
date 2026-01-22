@@ -372,6 +372,109 @@ test('shouldCopy returns false for tiny changes', () => {
 });
 
 // ============================================
+// PROPORTIONAL TO TRADER TESTS
+// ============================================
+
+console.log('\n--- Proportional to Trader Tests ---');
+
+test('proportional_to_trader: scales based on portfolio ratio', () => {
+  const calc = new CopySizeCalculator({
+    sizingMethod: 'proportional_to_trader',
+    minOrderSize: 1,
+  });
+
+  // Trader bought 1000 shares, trader portfolio is $10000, your balance is $1000
+  // Ratio = $1000 / $10000 = 10%
+  // So you should buy 100 shares (10% of 1000)
+  const result = calc.calculate({
+    change: makeChange(1000),
+    currentPrice: 0.50,
+    yourBalance: 1000,
+    traderPortfolioValue: 10000,
+  });
+
+  assertClose(result.shares, 100, 1, 'Should calculate 100 shares (10% of trader)');
+});
+
+test('proportional_to_trader: handles different ratios', () => {
+  const calc = new CopySizeCalculator({
+    sizingMethod: 'proportional_to_trader',
+    minOrderSize: 1,
+  });
+
+  // Trader bought 500 shares, trader portfolio is $50000, your balance is $5000
+  // Ratio = $5000 / $50000 = 10%
+  // So you should buy 50 shares (10% of 500)
+  const result = calc.calculate({
+    change: makeChange(500),
+    currentPrice: 0.60,
+    yourBalance: 5000,
+    traderPortfolioValue: 50000,
+  });
+
+  assertClose(result.shares, 50, 1, 'Should calculate 50 shares (10% of trader)');
+});
+
+test('proportional_to_trader: fallback when no portfolio value', () => {
+  const calc = new CopySizeCalculator({
+    sizingMethod: 'proportional_to_trader',
+    minOrderSize: 1,
+  });
+
+  // No trader portfolio value provided - should fallback to 10% of trader's shares
+  const result = calc.calculate({
+    change: makeChange(100),
+    currentPrice: 0.50,
+    yourBalance: 1000,
+    // traderPortfolioValue not provided
+  });
+
+  // Fallback: 10% of 100 = 10 shares
+  assertClose(result.shares, 10, 1, 'Should fallback to 10% of trader shares');
+  assert(result.reason.includes('no portfolio value'), 'Should mention fallback');
+});
+
+test('proportional_to_trader: small ratio (1%)', () => {
+  const calc = new CopySizeCalculator({
+    sizingMethod: 'proportional_to_trader',
+    minOrderSize: 1,
+  });
+
+  // Your balance $100, trader portfolio $10000 = 1% ratio
+  // Trader buys 1000 shares, you buy 10 shares
+  const result = calc.calculate({
+    change: makeChange(1000),
+    currentPrice: 0.50,
+    yourBalance: 100,
+    traderPortfolioValue: 10000,
+  });
+
+  assertClose(result.shares, 10, 1, 'Should calculate 10 shares (1% of trader)');
+});
+
+test('proportional_to_trader: capped by balance', () => {
+  const calc = new CopySizeCalculator({
+    sizingMethod: 'proportional_to_trader',
+    minOrderSize: 1,
+  });
+
+  // High ratio calculation but limited by balance
+  // Trader buys 10000 shares, your balance $50, trader portfolio $100
+  // Ratio = 50% but can only afford limited shares
+  const result = calc.calculate({
+    change: makeChange(10000),
+    currentPrice: 0.50,
+    yourBalance: 50,
+    traderPortfolioValue: 100,
+  });
+
+  // 50% of 10000 = 5000 shares @ $0.50 = $2500, but only have $50
+  // Affordable: $50 / $0.50 = 100 shares max
+  assert(result.shares <= 100, 'Should be capped by affordable amount');
+  assert(result.adjustments.some(a => a.includes('affordable')), 'Should note balance limit');
+});
+
+// ============================================
 // BELOW MIN LIMIT ACTION TESTS
 // ============================================
 

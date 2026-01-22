@@ -59,6 +59,9 @@ class CopyTradingBot {
   private oneClickSellEnabled: boolean;
   private keyboardListener: readline.Interface | null = null;
 
+  // Portfolio value prefetch interval
+  private portfolioValuePrefetchInterval: NodeJS.Timeout | null = null;
+
   // Tracking state
   private dailyPnL: number = 0;
   private totalPnL: number = 0;
@@ -262,11 +265,23 @@ class CopyTradingBot {
 
     // Step 3: Calculate copy size
     const balance = await this.executor.getBalance();
+
+    // Get trader portfolio value for proportional_to_trader sizing
+    // Uses cached value for low latency (cache is refreshed periodically)
+    let traderPortfolioValue: number | undefined;
+    try {
+      traderPortfolioValue = await this.api.getPortfolioValue(this.traderConfig.address);
+    } catch (error) {
+      // Non-fatal: calculator will use fallback if undefined
+      console.warn(`[SIZE] Could not get trader portfolio value: ${error}`);
+    }
+
     const sizeResult = this.sizeCalculator.calculate({
       change,
       currentPrice,
       yourBalance: balance,
       yourPosition,
+      traderPortfolioValue,
     });
 
     console.log(`[SIZE] ${sizeResult.reason}`);
@@ -437,6 +452,10 @@ class CopyTradingBot {
 
     await this.poller.start();
 
+    // Prefetch trader portfolio value and start periodic refresh
+    // This ensures low latency for proportional_to_trader sizing
+    await this.startPortfolioValuePrefetch();
+
     // Start TP/SL monitoring if enabled
     if (tpSlConfig.enabled && this.executor instanceof PaperTradingExecutor) {
       this.startTpSlMonitoring();
@@ -449,6 +468,32 @@ class CopyTradingBot {
 
     console.log("Press Ctrl+C to stop" + (this.oneClickSellEnabled ? ", 'q' to sell all positions" : ""));
     console.log("");
+  }
+
+  /**
+   * Start portfolio value prefetching for low-latency trader portfolio lookups
+   */
+  private async startPortfolioValuePrefetch(): Promise<void> {
+    const traderAddress = this.traderConfig.address;
+
+    // Initial fetch
+    try {
+      const portfolioValue = await this.api.getPortfolioValue(traderAddress);
+      const traderTag = this.traderConfig.tag || traderAddress.slice(0, 10);
+      console.log(`[PREFETCH] Trader ${traderTag} portfolio value: $${portfolioValue.toFixed(2)}`);
+    } catch (error) {
+      console.warn(`[PREFETCH] Could not fetch trader portfolio value: ${error}`);
+    }
+
+    // Set up periodic prefetch (every 30 seconds to keep cache warm)
+    const prefetchIntervalMs = 30000;
+    this.portfolioValuePrefetchInterval = setInterval(async () => {
+      try {
+        await this.api.prefetchPortfolioValue(traderAddress);
+      } catch {
+        // Silently ignore prefetch errors
+      }
+    }, prefetchIntervalMs);
   }
 
   /**
@@ -548,6 +593,12 @@ class CopyTradingBot {
   stop(): void {
     this.poller.stop();
     this.tpSlMonitor.stopMonitoring();
+
+    // Stop portfolio value prefetching
+    if (this.portfolioValuePrefetchInterval) {
+      clearInterval(this.portfolioValuePrefetchInterval);
+      this.portfolioValuePrefetchInterval = null;
+    }
 
     // Clean up keyboard listener
     if (process.stdin.isTTY) {

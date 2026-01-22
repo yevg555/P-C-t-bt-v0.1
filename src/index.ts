@@ -14,17 +14,28 @@
  */
 
 import * as dotenv from "dotenv";
+import * as readline from "readline";
 import { PositionPoller } from "./polling";
 import { PolymarketAPI } from "./api/polymarket-api";
 import { CopySizeCalculator } from "./strategy/copy-size";
 import { RiskChecker, TradingState } from "./strategy/risk-checker";
 import { PriceAdjuster } from "./strategy/price-adjuster";
+import { TpSlMonitor, TpSlTriggerEvent } from "./strategy/tp-sl-monitor";
 import {
   createExecutor,
   getTradingMode,
   PaperTradingExecutor,
 } from "./execution";
-import { PositionChange, OrderSpec, OrderExecutor, SellStrategy, OrderType } from "./types";
+import {
+  PositionChange,
+  OrderSpec,
+  OrderExecutor,
+  SellStrategy,
+  OrderType,
+  BelowMinLimitAction,
+  AutoTpSlConfig,
+  TraderConfig,
+} from "./types";
 
 // Load environment variables
 dotenv.config();
@@ -39,6 +50,14 @@ class CopyTradingBot {
   private riskChecker: RiskChecker;
   private priceAdjuster: PriceAdjuster;
   private executor: OrderExecutor;
+  private tpSlMonitor: TpSlMonitor;
+
+  // Trader configuration with tagging
+  private traderConfig: TraderConfig;
+
+  // 1-Click Sell state
+  private oneClickSellEnabled: boolean;
+  private keyboardListener: readline.Interface | null = null;
 
   // Tracking state
   private dailyPnL: number = 0;
@@ -61,6 +80,12 @@ class CopyTradingBot {
       console.log("");
       process.exit(1);
     }
+
+    // Set up trader config with tag
+    this.traderConfig = {
+      address: traderAddress,
+      tag: process.env.TRADER_TAG || undefined,
+    };
 
     const intervalMs = parseInt(process.env.POLLING_INTERVAL_MS || "1000");
 
@@ -85,7 +110,7 @@ class CopyTradingBot {
         process.env.PORTFOLIO_PERCENTAGE || "0.05"
       ),
       priceOffsetBps: parseInt(process.env.PRICE_OFFSET_BPS || "50"),
-      minOrderSize: parseInt(process.env.MIN_ORDER_SIZE || "10"),
+      minOrderSize: parseInt(process.env.MIN_ORDER_SIZE || "5"), // Polymarket min is 5
       maxPositionPerToken: parseInt(
         process.env.MAX_POSITION_PER_TOKEN || "1000"
       ),
@@ -94,11 +119,17 @@ class CopyTradingBot {
       sellStrategy: (process.env.SELL_STRATEGY as SellStrategy) || "proportional",
       orderType: (process.env.ORDER_TYPE as OrderType) || "limit",
       orderExpirationSeconds: parseInt(process.env.ORDER_EXPIRATION_SECONDS || "30"),
+      // Below min limit action
+      belowMinLimitAction: (process.env.BELOW_MIN_LIMIT_ACTION as BelowMinLimitAction) || "buy_at_min",
     });
 
     this.riskChecker = new RiskChecker({
       maxDailyLoss: parseFloat(process.env.MAX_DAILY_LOSS || "100"),
       maxTotalLoss: parseFloat(process.env.MAX_TOTAL_LOSS || "500"),
+      // Spending limits
+      maxTokenSpend: parseFloat(process.env.MAX_TOKEN_SPEND || "0"),
+      maxMarketSpend: parseFloat(process.env.MAX_MARKET_SPEND || "0"),
+      totalHoldingsLimit: parseFloat(process.env.TOTAL_HOLDINGS_LIMIT || "0"),
     });
 
     this.priceAdjuster = new PriceAdjuster(
@@ -109,6 +140,17 @@ class CopyTradingBot {
     this.executor = createExecutor({
       paperBalance: parseFloat(process.env.PAPER_TRADING_BALANCE || "1000"),
     });
+
+    // Initialize Auto TP/SL monitor
+    const tpSlConfig: AutoTpSlConfig = {
+      enabled: process.env.AUTO_TP_SL_ENABLED === "true",
+      takeProfitPercent: parseFloat(process.env.TAKE_PROFIT_PERCENT || "0.10"),
+      stopLossPercent: parseFloat(process.env.STOP_LOSS_PERCENT || "0.05"),
+    };
+    this.tpSlMonitor = new TpSlMonitor(tpSlConfig);
+
+    // 1-Click Sell configuration
+    this.oneClickSellEnabled = process.env.ONE_CLICK_SELL_ENABLED !== "false";
 
     this.setupEventHandlers();
   }
@@ -137,6 +179,42 @@ class CopyTradingBot {
     this.poller.on("recovered", () => {
       console.log("[BOT] Poller recovered from errors");
     });
+
+    // TP/SL trigger handler
+    this.tpSlMonitor.on("trigger", async (event: TpSlTriggerEvent) => {
+      await this.handleTpSlTrigger(event);
+    });
+  }
+
+  /**
+   * Handle Auto TP/SL trigger
+   */
+  private async handleTpSlTrigger(event: TpSlTriggerEvent): Promise<void> {
+    const traderTag = this.traderConfig.tag || this.traderConfig.address.slice(0, 10);
+
+    console.log("");
+    console.log("=".repeat(60));
+    console.log(`[${traderTag}] AUTO ${event.triggerType.toUpperCase().replace("_", " ")} TRIGGERED`);
+    console.log(`Token: ${event.tokenId.slice(0, 20)}...`);
+    console.log(`Entry: $${event.entryPrice.toFixed(4)} -> Current: $${event.currentPrice.toFixed(4)}`);
+    console.log(`Change: ${(event.percentChange * 100).toFixed(2)}%`);
+    console.log("=".repeat(60));
+
+    try {
+      const result = await this.executor.execute(event.order);
+
+      if (result.status === "filled") {
+        this.tradeCount++;
+        console.log(`[TP/SL] SELL FILLED: ${result.filledSize} shares @ $${result.avgFillPrice?.toFixed(4)}`);
+      } else {
+        console.log(`[TP/SL] SELL ${result.status.toUpperCase()}: ${result.error || "Unknown error"}`);
+      }
+    } catch (error) {
+      console.error(`[TP/SL] Execution failed: ${error}`);
+    }
+
+    console.log("=".repeat(60));
+    console.log("");
   }
 
   /**
@@ -144,10 +222,11 @@ class CopyTradingBot {
    */
   private async handlePositionChange(change: PositionChange): Promise<void> {
     const startTime = Date.now();
+    const traderTag = this.traderConfig.tag || this.traderConfig.address.slice(0, 10);
 
     console.log("");
     console.log("=".repeat(60));
-    console.log(`TRADE DETECTED: ${change.side} ${change.delta.toFixed(2)} shares`);
+    console.log(`[${traderTag}] TRADE DETECTED: ${change.side} ${change.delta.toFixed(2)} shares`);
     console.log(`Token: ${change.tokenId.slice(0, 20)}...`);
     if (change.marketTitle) {
       console.log(`Market: ${change.marketTitle}`);
@@ -286,12 +365,16 @@ class CopyTradingBot {
       this.dailyPnL = this.totalPnL; // For now, daily = total (no daily reset)
     }
 
+    // Get spend tracker if available
+    const spendTracker = this.executor.getSpendTracker?.();
+
     return {
       dailyPnL: this.dailyPnL,
       totalPnL: this.totalPnL,
       balance,
       positions,
       totalShares,
+      spendTracker,
     };
   }
 
@@ -301,12 +384,20 @@ class CopyTradingBot {
   async start(): Promise<void> {
     console.log("");
     console.log("╔═══════════════════════════════════════════════════════════╗");
-    console.log("║          POLYMARKET COPY TRADING BOT v1.0                 ║");
+    console.log("║          POLYMARKET COPY TRADING BOT v2.0                 ║");
     console.log("╚═══════════════════════════════════════════════════════════╝");
     console.log("");
+
     const orderConfig = this.sizeCalculator.getOrderConfig();
+    const copyConfig = this.sizeCalculator.getConfig();
+    const riskConfig = this.riskChecker.getConfig();
+    const tpSlConfig = this.tpSlMonitor.getConfig();
+    const traderDisplay = this.traderConfig.tag
+      ? `${this.traderConfig.tag} (${this.traderConfig.address.slice(0, 10)}...)`
+      : `${this.traderConfig.address.slice(0, 10)}...`;
+
     console.log(`  Mode:            ${getTradingMode().toUpperCase()}`);
-    console.log(`  Trader:          ${process.env.TRADER_ADDRESS?.slice(0, 10)}...`);
+    console.log(`  Trader:          ${traderDisplay}`);
     console.log(`  Poll Interval:   ${process.env.POLLING_INTERVAL_MS || 1000}ms`);
     console.log(`  Sizing:          ${process.env.SIZING_METHOD || "proportional_to_portfolio"}`);
     console.log(`  Portfolio %:     ${(parseFloat(process.env.PORTFOLIO_PERCENTAGE || "0.05") * 100).toFixed(1)}%`);
@@ -317,10 +408,138 @@ class CopyTradingBot {
     console.log(`  Starting Balance: $${(await this.executor.getBalance()).toFixed(2)}`);
     console.log("");
 
+    // Display new feature settings
+    console.log("  --- Feature Settings ---");
+    console.log(`  Below Min Action: ${copyConfig.belowMinLimitAction?.toUpperCase() || "SKIP"}`);
+    console.log(`  Min Order Size:   ${copyConfig.minOrderSize} shares`);
+
+    // Spending limits
+    if (riskConfig.maxTokenSpend && riskConfig.maxTokenSpend > 0) {
+      console.log(`  Max Token Spend:  $${riskConfig.maxTokenSpend}`);
+    }
+    if (riskConfig.maxMarketSpend && riskConfig.maxMarketSpend > 0) {
+      console.log(`  Max Market Spend: $${riskConfig.maxMarketSpend}`);
+    }
+    if (riskConfig.totalHoldingsLimit && riskConfig.totalHoldingsLimit > 0) {
+      console.log(`  Holdings Limit:   $${riskConfig.totalHoldingsLimit}`);
+    }
+
+    // TP/SL settings
+    console.log(`  Auto TP/SL:       ${tpSlConfig.enabled ? "ENABLED" : "DISABLED"}`);
+    if (tpSlConfig.enabled) {
+      console.log(`    Take Profit:    +${((tpSlConfig.takeProfitPercent || 0) * 100).toFixed(1)}%`);
+      console.log(`    Stop Loss:      -${((tpSlConfig.stopLossPercent || 0) * 100).toFixed(1)}%`);
+    }
+
+    // 1-Click Sell
+    console.log(`  1-Click Sell:     ${this.oneClickSellEnabled ? "ENABLED (press 'q')" : "DISABLED"}`);
+    console.log("");
+
     await this.poller.start();
 
-    console.log("Press Ctrl+C to stop");
+    // Start TP/SL monitoring if enabled
+    if (tpSlConfig.enabled && this.executor instanceof PaperTradingExecutor) {
+      this.startTpSlMonitoring();
+    }
+
+    // Set up 1-Click Sell keyboard handler
+    if (this.oneClickSellEnabled) {
+      this.setupOneClickSell();
+    }
+
+    console.log("Press Ctrl+C to stop" + (this.oneClickSellEnabled ? ", 'q' to sell all positions" : ""));
     console.log("");
+  }
+
+  /**
+   * Start TP/SL monitoring
+   */
+  private startTpSlMonitoring(): void {
+    if (!(this.executor instanceof PaperTradingExecutor)) {
+      return;
+    }
+
+    const executor = this.executor;
+
+    this.tpSlMonitor.startMonitoring(
+      async () => executor.getAllPositionDetails(),
+      async (tokenIds: string[]) => {
+        const prices = new Map<string, number>();
+        for (const tokenId of tokenIds) {
+          try {
+            // Get price for monitoring (use BUY side as reference)
+            const price = await this.api.getPrice(tokenId, "SELL");
+            prices.set(tokenId, price);
+          } catch {
+            // Skip if price fetch fails
+          }
+        }
+        return prices;
+      }
+    );
+  }
+
+  /**
+   * Set up 1-Click Sell keyboard handler
+   */
+  private setupOneClickSell(): void {
+    // Only works in TTY mode
+    if (!process.stdin.isTTY) {
+      console.log("[1-Click Sell] Not available (not running in TTY mode)");
+      return;
+    }
+
+    readline.emitKeypressEvents(process.stdin);
+    process.stdin.setRawMode(true);
+
+    process.stdin.on("keypress", async (str, key) => {
+      // Handle Ctrl+C
+      if (key.ctrl && key.name === "c") {
+        process.emit("SIGINT");
+        return;
+      }
+
+      // Handle 'q' for 1-Click Sell
+      if (key.name === "q") {
+        await this.executeOneClickSell();
+      }
+    });
+  }
+
+  /**
+   * Execute 1-Click Sell - sell all positions immediately
+   */
+  private async executeOneClickSell(): Promise<void> {
+    if (!(this.executor instanceof PaperTradingExecutor)) {
+      console.log("[1-Click Sell] Only available in paper trading mode");
+      return;
+    }
+
+    const executor = this.executor;
+    const positions = await executor.getAllPositionDetails();
+
+    if (positions.size === 0) {
+      console.log("\n[1-Click Sell] No positions to sell\n");
+      return;
+    }
+
+    // Get current prices for all positions
+    const currentPrices = new Map<string, number>();
+    for (const [tokenId, position] of positions) {
+      try {
+        const price = await this.api.getPrice(tokenId, "SELL");
+        currentPrices.set(tokenId, price);
+      } catch {
+        // Use avgPrice as fallback
+        currentPrices.set(tokenId, position.avgPrice);
+      }
+    }
+
+    // Execute sell all
+    const results = await executor.sellAllPositions(currentPrices);
+
+    // Update trade count
+    this.tradeCount += results.filter((r) => r.status === "filled").length;
   }
 
   /**
@@ -328,6 +547,12 @@ class CopyTradingBot {
    */
   stop(): void {
     this.poller.stop();
+    this.tpSlMonitor.stopMonitoring();
+
+    // Clean up keyboard listener
+    if (process.stdin.isTTY) {
+      process.stdin.setRawMode(false);
+    }
   }
 
   /**

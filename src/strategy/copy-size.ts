@@ -26,7 +26,7 @@
  *   → You sell 50 shares (50% of your position)
  */
 
-import { PositionChange, CopyConfig, SellStrategy } from '../types';
+import { PositionChange, CopyConfig, SellStrategy, BelowMinLimitAction } from '../types';
 
 /**
  * Input needed to calculate copy size
@@ -69,18 +69,24 @@ export interface CopySizeResult {
 }
 
 /**
+ * Polymarket minimum order size
+ */
+export const POLYMARKET_MIN_SHARES = 5;
+
+/**
  * Default configuration
  */
 export const DEFAULT_COPY_CONFIG: CopyConfig = {
   sizingMethod: 'proportional_to_portfolio',
   portfolioPercentage: 0.05, // 5% per trade
   priceOffsetBps: 50, // 0.5% price buffer
-  minOrderSize: 10, // Minimum 10 shares
+  minOrderSize: POLYMARKET_MIN_SHARES, // Polymarket requires minimum 5 shares
   maxPositionPerToken: 1000, // Max 1000 shares per token
   maxTotalPosition: 5000, // Max 5000 total
   sellStrategy: 'proportional', // Match trader's % reduction
   orderType: 'limit', // Use limit orders
   orderExpirationSeconds: 30, // Cancel after 30s if not filled
+  belowMinLimitAction: 'buy_at_min', // Buy at minimum when below limit
 };
 
 export class CopySizeCalculator {
@@ -186,11 +192,22 @@ export class CopySizeCalculator {
 
     // 2. Check minimum order size
     if (finalShares < this.config.minOrderSize && finalShares > 0) {
-      adjustments.push(
-        `Below minimum (${finalShares.toFixed(2)} < ${this.config.minOrderSize})`
-      );
-      // Depending on config, either skip or round up
-      finalShares = 0; // Skip tiny orders
+      const belowMinAction = this.config.belowMinLimitAction || 'skip';
+
+      if (belowMinAction === 'buy_at_min') {
+        // Buy at minimum order size (Polymarket requires 5 shares minimum)
+        const minSize = Math.max(this.config.minOrderSize, POLYMARKET_MIN_SHARES);
+        adjustments.push(
+          `Below minimum (${finalShares.toFixed(2)} < ${this.config.minOrderSize}), buying at min: ${minSize} shares`
+        );
+        finalShares = minSize;
+      } else {
+        // Skip the trade
+        adjustments.push(
+          `Below minimum (${finalShares.toFixed(2)} < ${this.config.minOrderSize}), skipping trade`
+        );
+        finalShares = 0;
+      }
     }
 
     // 3. Round to reasonable precision (2 decimal places)

@@ -36,6 +36,41 @@ interface OrderBookResponse {
   asks?: Array<{ price: string; size: string }>;
 }
 
+/**
+ * Raw trade/activity response from the API
+ */
+export interface RawTradeResponse {
+  id?: string;
+  taker_order_id?: string;
+  market?: string;
+  asset?: string;
+  token_id?: string;
+  side?: "BUY" | "SELL";
+  size?: string | number;
+  price?: string | number;
+  status?: string;
+  timestamp?: string;
+  transaction_hash?: string;
+  outcome?: string;
+  title?: string;
+}
+
+/**
+ * Normalized trade/activity record
+ */
+export interface Trade {
+  id: string;
+  tokenId: string;
+  marketId: string;
+  side: "BUY" | "SELL";
+  size: number;
+  price: number;
+  timestamp: Date;
+  transactionHash?: string;
+  marketTitle?: string;
+  outcome?: string;
+}
+
 // Extended position with curPrice
 export interface PositionWithPrice extends Position {
   curPrice: number;
@@ -83,6 +118,69 @@ export class PolymarketAPI {
       }
       throw error;
     }
+  }
+
+  // ===================================
+  // TRADES / ACTIVITY (Data API)
+  // ===================================
+
+  /**
+   * Fetch recent trades/activity for a wallet address
+   *
+   * @param address - Wallet address
+   * @param limit - Max number of trades to return (default 100)
+   * @returns Array of trades, most recent first
+   */
+  async getTrades(address: string, limit: number = 100): Promise<Trade[]> {
+    await this.respectRateLimit();
+
+    const url = `${this.dataApiUrl}/activity?user=${address}&limit=${limit}`;
+
+    try {
+      const response = await fetch(url, {
+        method: "GET",
+        headers: { Accept: "application/json" },
+      });
+
+      if (!response.ok) {
+        if (response.status === 429) {
+          throw new Error("RATE_LIMITED: Too many requests");
+        }
+        throw new Error(`API_ERROR: ${response.status} ${response.statusText}`);
+      }
+
+      const data = (await response.json()) as unknown;
+      return this.transformTrades(data);
+    } catch (error) {
+      if (error instanceof Error) {
+        console.error(`[API] getTrades error: ${error.message}`);
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Get trades for a specific market/token
+   *
+   * @param address - Wallet address
+   * @param tokenId - Token ID to filter by
+   * @param limit - Max number of trades
+   */
+  async getTradesForToken(
+    address: string,
+    tokenId: string,
+    limit: number = 50
+  ): Promise<Trade[]> {
+    const allTrades = await this.getTrades(address, limit * 2); // Fetch extra to filter
+    return allTrades.filter((t) => t.tokenId === tokenId).slice(0, limit);
+  }
+
+  /**
+   * Get the most recent trade for a wallet
+   */
+  async getLatestTrade(address: string): Promise<Trade | null> {
+    const trades = await this.getTrades(address, 1);
+    return trades.length > 0 ? trades[0] : null;
   }
 
   // ===================================
@@ -339,5 +437,67 @@ export class PolymarketAPI {
 
   private sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  // ===================================
+  // TRADE TRANSFORMATION
+  // ===================================
+
+  private transformTrades(data: unknown): Trade[] {
+    if (!data) return [];
+
+    let trades: unknown[];
+
+    if (Array.isArray(data)) {
+      trades = data;
+    } else if (typeof data === "object" && data !== null) {
+      const obj = data as Record<string, unknown>;
+      trades = (obj.history || obj.activity || obj.trades || obj.data || []) as unknown[];
+    } else {
+      trades = [];
+    }
+
+    if (!Array.isArray(trades)) {
+      console.warn("[API] Unexpected trades response format:", typeof data);
+      return [];
+    }
+
+    return trades
+      .map((item) => this.transformTrade(item as RawTradeResponse))
+      .filter((t): t is Trade => t !== null);
+  }
+
+  private transformTrade(item: RawTradeResponse): Trade | null {
+    try {
+      const id = item.id || item.taker_order_id || "";
+      const tokenId = item.asset || item.token_id || "";
+      const side = item.side || "BUY";
+
+      const rawSize = item.size;
+      const size = typeof rawSize === "string" ? parseFloat(rawSize) : rawSize || 0;
+
+      const rawPrice = item.price;
+      const price = typeof rawPrice === "string" ? parseFloat(rawPrice) : rawPrice || 0;
+
+      if (!tokenId || size <= 0) {
+        return null;
+      }
+
+      return {
+        id,
+        tokenId,
+        marketId: item.market || "",
+        side,
+        size,
+        price,
+        timestamp: item.timestamp ? new Date(item.timestamp) : new Date(),
+        transactionHash: item.transaction_hash,
+        marketTitle: item.title,
+        outcome: item.outcome,
+      };
+    } catch (error) {
+      console.error(`[API] transformTrade failed:`, error);
+      return null;
+    }
   }
 }

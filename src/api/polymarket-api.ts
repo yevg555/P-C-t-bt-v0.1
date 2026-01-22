@@ -38,12 +38,16 @@ interface OrderBookResponse {
 
 /**
  * Portfolio value response from the API
+ * Can be either an array or single object
  */
-interface PortfolioValueResponse {
+interface PortfolioValueResponseItem {
+  user?: string;
   value?: string | number;
   total?: string | number;
   portfolio_value?: string | number;
 }
+
+type PortfolioValueResponse = PortfolioValueResponseItem | PortfolioValueResponseItem[];
 
 /**
  * Cached portfolio value with timestamp
@@ -192,8 +196,17 @@ export class PolymarketAPI {
 
       const data = (await response.json()) as PortfolioValueResponse;
 
-      // Parse value from response (handle different field names)
-      const rawValue = data.value ?? data.total ?? data.portfolio_value ?? 0;
+      // Parse value from response - handle array or object format
+      // API returns: [{"user":"0x...", "value": 47766.0034}] or {"value": 47766.0034}
+      let item: PortfolioValueResponseItem;
+      if (Array.isArray(data)) {
+        // Array format - find matching user or take first item
+        item = data.find(d => d.user?.toLowerCase() === address.toLowerCase()) || data[0] || {};
+      } else {
+        item = data || {};
+      }
+
+      const rawValue = item.value ?? item.total ?? item.portfolio_value ?? 0;
       const value = typeof rawValue === "string" ? parseFloat(rawValue) : rawValue;
 
       // Cache the result

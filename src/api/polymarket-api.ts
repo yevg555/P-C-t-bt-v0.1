@@ -128,13 +128,33 @@ export class PolymarketAPI {
    * Fetch recent trades/activity for a wallet address
    *
    * @param address - Wallet address
-   * @param limit - Max number of trades to return (default 100)
+   * @param options - Query options
+   * @param options.limit - Max number of trades to return (default 100)
+   * @param options.after - Unix timestamp (seconds) - only return trades after this time
    * @returns Array of trades, most recent first
+   *
+   * @example
+   * // Get all recent trades
+   * const trades = await api.getTrades(address);
+   *
+   * // Get trades after a specific timestamp (for incremental updates)
+   * const lastTradeTime = Math.floor(lastTrade.timestamp.getTime() / 1000);
+   * const newTrades = await api.getTrades(address, { after: lastTradeTime });
    */
-  async getTrades(address: string, limit: number = 100): Promise<Trade[]> {
+  async getTrades(
+    address: string,
+    options: { limit?: number; after?: number } = {}
+  ): Promise<Trade[]> {
     await this.respectRateLimit();
 
-    const url = `${this.dataApiUrl}/activity?user=${address}&limit=${limit}`;
+    const { limit = 100, after } = options;
+
+    let url = `${this.dataApiUrl}/activity?user=${address}&limit=${limit}`;
+
+    // Add 'after' parameter for incremental fetching
+    if (after !== undefined) {
+      url += `&after=${after}`;
+    }
 
     try {
       const response = await fetch(url, {
@@ -164,14 +184,15 @@ export class PolymarketAPI {
    *
    * @param address - Wallet address
    * @param tokenId - Token ID to filter by
-   * @param limit - Max number of trades
+   * @param options - Query options (limit, after)
    */
   async getTradesForToken(
     address: string,
     tokenId: string,
-    limit: number = 50
+    options: { limit?: number; after?: number } = {}
   ): Promise<Trade[]> {
-    const allTrades = await this.getTrades(address, limit * 2); // Fetch extra to filter
+    const { limit = 50, after } = options;
+    const allTrades = await this.getTrades(address, { limit: limit * 2, after });
     return allTrades.filter((t) => t.tokenId === tokenId).slice(0, limit);
   }
 
@@ -179,8 +200,42 @@ export class PolymarketAPI {
    * Get the most recent trade for a wallet
    */
   async getLatestTrade(address: string): Promise<Trade | null> {
-    const trades = await this.getTrades(address, 1);
+    const trades = await this.getTrades(address, { limit: 1 });
     return trades.length > 0 ? trades[0] : null;
+  }
+
+  /**
+   * Get new trades since a specific timestamp
+   * Useful for incremental polling - only fetch trades we haven't seen
+   *
+   * @param address - Wallet address
+   * @param sinceTimestamp - Date object or Unix timestamp (seconds)
+   * @returns Array of new trades since the timestamp
+   *
+   * @example
+   * // Track new trades incrementally
+   * let lastCheckTime = Date.now();
+   *
+   * // Later, get only new trades
+   * const newTrades = await api.getTradesSince(address, lastCheckTime);
+   * if (newTrades.length > 0) {
+   *   lastCheckTime = newTrades[0].timestamp.getTime(); // Update to most recent
+   *   // Process new trades...
+   * }
+   */
+  async getTradesSince(
+    address: string,
+    sinceTimestamp: Date | number,
+    limit: number = 100
+  ): Promise<Trade[]> {
+    const afterUnix =
+      typeof sinceTimestamp === "number"
+        ? sinceTimestamp < 1e12
+          ? sinceTimestamp // Already in seconds
+          : Math.floor(sinceTimestamp / 1000) // Convert ms to seconds
+        : Math.floor(sinceTimestamp.getTime() / 1000); // Date to seconds
+
+    return this.getTrades(address, { limit, after: afterUnix });
   }
 
   // ===================================

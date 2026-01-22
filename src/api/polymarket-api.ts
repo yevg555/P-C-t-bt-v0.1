@@ -36,6 +36,41 @@ interface OrderBookResponse {
   asks?: Array<{ price: string; size: string }>;
 }
 
+/**
+ * Raw trade/activity response from the API
+ */
+export interface RawTradeResponse {
+  id?: string;
+  taker_order_id?: string;
+  market?: string;
+  asset?: string;
+  token_id?: string;
+  side?: "BUY" | "SELL";
+  size?: string | number;
+  price?: string | number;
+  status?: string;
+  timestamp?: string;
+  transaction_hash?: string;
+  outcome?: string;
+  title?: string;
+}
+
+/**
+ * Normalized trade/activity record
+ */
+export interface Trade {
+  id: string;
+  tokenId: string;
+  marketId: string;
+  side: "BUY" | "SELL";
+  size: number;
+  price: number;
+  timestamp: Date;
+  transactionHash?: string;
+  marketTitle?: string;
+  outcome?: string;
+}
+
 // Extended position with curPrice
 export interface PositionWithPrice extends Position {
   curPrice: number;
@@ -83,6 +118,124 @@ export class PolymarketAPI {
       }
       throw error;
     }
+  }
+
+  // ===================================
+  // TRADES / ACTIVITY (Data API)
+  // ===================================
+
+  /**
+   * Fetch recent trades/activity for a wallet address
+   *
+   * @param address - Wallet address
+   * @param options - Query options
+   * @param options.limit - Max number of trades to return (default 100)
+   * @param options.after - Unix timestamp (seconds) - only return trades after this time
+   * @returns Array of trades, most recent first
+   *
+   * @example
+   * // Get all recent trades
+   * const trades = await api.getTrades(address);
+   *
+   * // Get trades after a specific timestamp (for incremental updates)
+   * const lastTradeTime = Math.floor(lastTrade.timestamp.getTime() / 1000);
+   * const newTrades = await api.getTrades(address, { after: lastTradeTime });
+   */
+  async getTrades(
+    address: string,
+    options: { limit?: number; after?: number } = {}
+  ): Promise<Trade[]> {
+    await this.respectRateLimit();
+
+    const { limit = 100, after } = options;
+
+    let url = `${this.dataApiUrl}/activity?user=${address}&limit=${limit}`;
+
+    // Add 'after' parameter for incremental fetching
+    if (after !== undefined) {
+      url += `&after=${after}`;
+    }
+
+    try {
+      const response = await fetch(url, {
+        method: "GET",
+        headers: { Accept: "application/json" },
+      });
+
+      if (!response.ok) {
+        if (response.status === 429) {
+          throw new Error("RATE_LIMITED: Too many requests");
+        }
+        throw new Error(`API_ERROR: ${response.status} ${response.statusText}`);
+      }
+
+      const data = (await response.json()) as unknown;
+      return this.transformTrades(data);
+    } catch (error) {
+      if (error instanceof Error) {
+        console.error(`[API] getTrades error: ${error.message}`);
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Get trades for a specific market/token
+   *
+   * @param address - Wallet address
+   * @param tokenId - Token ID to filter by
+   * @param options - Query options (limit, after)
+   */
+  async getTradesForToken(
+    address: string,
+    tokenId: string,
+    options: { limit?: number; after?: number } = {}
+  ): Promise<Trade[]> {
+    const { limit = 50, after } = options;
+    const allTrades = await this.getTrades(address, { limit: limit * 2, after });
+    return allTrades.filter((t) => t.tokenId === tokenId).slice(0, limit);
+  }
+
+  /**
+   * Get the most recent trade for a wallet
+   */
+  async getLatestTrade(address: string): Promise<Trade | null> {
+    const trades = await this.getTrades(address, { limit: 1 });
+    return trades.length > 0 ? trades[0] : null;
+  }
+
+  /**
+   * Get new trades since a specific timestamp
+   * Useful for incremental polling - only fetch trades we haven't seen
+   *
+   * @param address - Wallet address
+   * @param sinceTimestamp - Date object or Unix timestamp (seconds)
+   * @returns Array of new trades since the timestamp
+   *
+   * @example
+   * // Track new trades incrementally
+   * let lastCheckTime = Date.now();
+   *
+   * // Later, get only new trades
+   * const newTrades = await api.getTradesSince(address, lastCheckTime);
+   * if (newTrades.length > 0) {
+   *   lastCheckTime = newTrades[0].timestamp.getTime(); // Update to most recent
+   *   // Process new trades...
+   * }
+   */
+  async getTradesSince(
+    address: string,
+    sinceTimestamp: Date | number,
+    limit: number = 100
+  ): Promise<Trade[]> {
+    const afterUnix =
+      typeof sinceTimestamp === "number"
+        ? sinceTimestamp < 1e12
+          ? sinceTimestamp // Already in seconds
+          : Math.floor(sinceTimestamp / 1000) // Convert ms to seconds
+        : Math.floor(sinceTimestamp.getTime() / 1000); // Date to seconds
+
+    return this.getTrades(address, { limit, after: afterUnix });
   }
 
   // ===================================
@@ -339,5 +492,67 @@ export class PolymarketAPI {
 
   private sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  // ===================================
+  // TRADE TRANSFORMATION
+  // ===================================
+
+  private transformTrades(data: unknown): Trade[] {
+    if (!data) return [];
+
+    let trades: unknown[];
+
+    if (Array.isArray(data)) {
+      trades = data;
+    } else if (typeof data === "object" && data !== null) {
+      const obj = data as Record<string, unknown>;
+      trades = (obj.history || obj.activity || obj.trades || obj.data || []) as unknown[];
+    } else {
+      trades = [];
+    }
+
+    if (!Array.isArray(trades)) {
+      console.warn("[API] Unexpected trades response format:", typeof data);
+      return [];
+    }
+
+    return trades
+      .map((item) => this.transformTrade(item as RawTradeResponse))
+      .filter((t): t is Trade => t !== null);
+  }
+
+  private transformTrade(item: RawTradeResponse): Trade | null {
+    try {
+      const id = item.id || item.taker_order_id || "";
+      const tokenId = item.asset || item.token_id || "";
+      const side = item.side || "BUY";
+
+      const rawSize = item.size;
+      const size = typeof rawSize === "string" ? parseFloat(rawSize) : rawSize || 0;
+
+      const rawPrice = item.price;
+      const price = typeof rawPrice === "string" ? parseFloat(rawPrice) : rawPrice || 0;
+
+      if (!tokenId || size <= 0) {
+        return null;
+      }
+
+      return {
+        id,
+        tokenId,
+        marketId: item.market || "",
+        side,
+        size,
+        price,
+        timestamp: item.timestamp ? new Date(item.timestamp) : new Date(),
+        transactionHash: item.transaction_hash,
+        marketTitle: item.title,
+        outcome: item.outcome,
+      };
+    } catch (error) {
+      console.error(`[API] transformTrade failed:`, error);
+      return null;
+    }
   }
 }

@@ -267,13 +267,17 @@ class CopyTradingBot {
     const balance = await this.executor.getBalance();
 
     // Get trader portfolio value for proportional_to_trader sizing
-    // Uses cached value for low latency (cache is refreshed periodically)
-    let traderPortfolioValue: number | undefined;
-    try {
-      traderPortfolioValue = await this.api.getPortfolioValue(this.traderConfig.address);
-    } catch (error) {
-      // Non-fatal: calculator will use fallback if undefined
-      console.warn(`[SIZE] Could not get trader portfolio value: ${error}`);
+    // Try cached value first (sync, zero latency), fallback to API call
+    let traderPortfolioValue: number | undefined =
+      this.api.getCachedPortfolioValue(this.traderConfig.address);
+
+    if (traderPortfolioValue === undefined) {
+      try {
+        traderPortfolioValue = await this.api.getPortfolioValue(this.traderConfig.address);
+      } catch (error) {
+        // Non-fatal: calculator will use fallback if undefined
+        console.warn(`[SIZE] Could not get trader portfolio value: ${error}`);
+      }
     }
 
     const sizeResult = this.sizeCalculator.calculate({

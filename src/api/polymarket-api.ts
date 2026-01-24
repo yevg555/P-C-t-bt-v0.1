@@ -58,6 +58,14 @@ interface CachedPortfolioValue {
 }
 
 /**
+ * Cached price with timestamp
+ */
+interface CachedPrice {
+  price: number;
+  timestamp: number;
+}
+
+/**
  * Raw trade/activity response from the API
  */
 export interface RawTradeResponse {
@@ -109,6 +117,11 @@ export class PolymarketAPI {
   private portfolioValueCache: Map<string, CachedPortfolioValue> = new Map();
   // Cache TTL in milliseconds (default 30 seconds)
   private portfolioValueCacheTtlMs: number = 30000;
+
+  // Price cache: "tokenId:side" -> cached price
+  private priceCache: Map<string, CachedPrice> = new Map();
+  // Price cache TTL in milliseconds (default 5 seconds - prices change frequently)
+  private priceCacheTtlMs: number = 5000;
 
   // ===================================
   // POSITIONS (Data API)
@@ -401,6 +414,7 @@ export class PolymarketAPI {
 
   /**
    * Get the execution price for a trade
+   * Uses caching to reduce API calls (5s TTL by default)
    *
    * IMPORTANT: Maps our trade intent to correct API parameter!
    *   - tradeIntent='BUY'  → we need ASK → API side=SELL
@@ -408,12 +422,26 @@ export class PolymarketAPI {
    *
    * @param tokenId - The token ID
    * @param tradeIntent - What YOU want to do: 'BUY' or 'SELL'
+   * @param options - Options for fetching
+   * @param options.skipCache - Bypass cache and fetch fresh price
    * @returns The price you'll pay (for BUY) or receive (for SELL)
    */
   async getPrice(
     tokenId: string,
     tradeIntent: "BUY" | "SELL",
+    options: { skipCache?: boolean } = {}
   ): Promise<number> {
+    const { skipCache = false } = options;
+    const cacheKey = `${tokenId}:${tradeIntent}`;
+
+    // Check cache first
+    if (!skipCache) {
+      const cached = this.priceCache.get(cacheKey);
+      if (cached && Date.now() - cached.timestamp < this.priceCacheTtlMs) {
+        return cached.price;
+      }
+    }
+
     await this.respectRateLimit();
 
     // FLIP THE SIDE!
@@ -443,11 +471,73 @@ export class PolymarketAPI {
         );
       }
 
+      // Cache the result
+      this.priceCache.set(cacheKey, {
+        price,
+        timestamp: Date.now(),
+      });
+
       return price;
     } catch (error) {
       console.error(`[API] getPrice failed: ${error}`);
+
+      // Return cached value as fallback (even if stale)
+      const cached = this.priceCache.get(cacheKey);
+      if (cached) {
+        console.warn(`[API] Using stale cached price for ${tokenId.slice(0, 10)}...`);
+        return cached.price;
+      }
+
       throw error;
     }
+  }
+
+  /**
+   * Get prices for multiple tokens in parallel
+   * Much faster than sequential calls when fetching many prices
+   *
+   * @param requests - Array of {tokenId, side} to fetch
+   * @returns Map of "tokenId" -> price
+   */
+  async getPricesParallel(
+    requests: Array<{ tokenId: string; side: "BUY" | "SELL" }>
+  ): Promise<Map<string, number>> {
+    const results = new Map<string, number>();
+
+    // Fetch all prices in parallel
+    const promises = requests.map(async ({ tokenId, side }) => {
+      try {
+        const price = await this.getPrice(tokenId, side);
+        return { tokenId, price, success: true };
+      } catch {
+        return { tokenId, price: 0, success: false };
+      }
+    });
+
+    const settled = await Promise.all(promises);
+
+    for (const result of settled) {
+      if (result.success) {
+        results.set(result.tokenId, result.price);
+      }
+    }
+
+    return results;
+  }
+
+  /**
+   * Set price cache TTL
+   * @param ttlMs - Cache TTL in milliseconds
+   */
+  setPriceCacheTtl(ttlMs: number): void {
+    this.priceCacheTtlMs = ttlMs;
+  }
+
+  /**
+   * Clear price cache
+   */
+  clearPriceCache(): void {
+    this.priceCache.clear();
   }
 
   /**

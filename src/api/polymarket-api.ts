@@ -70,21 +70,38 @@ interface CachedPrice {
 
 /**
  * Raw trade/activity response from the API
+ * Based on actual Polymarket /activity endpoint response
  */
 export interface RawTradeResponse {
-  id?: string;
-  taker_order_id?: string;
-  market?: string;
-  asset?: string;
-  token_id?: string;
+  // Wallet info
+  proxyWallet?: string;
+
+  // Identifiers
+  transactionHash?: string;
+  conditionId?: string;  // This is the market/condition ID
+  asset?: string;        // This is the token ID (long number string)
+
+  // Trade details
+  type?: string;         // "TRADE" for trades
   side?: "BUY" | "SELL";
-  size?: string | number;
-  price?: string | number;
-  status?: string;
-  timestamp?: string;
-  transaction_hash?: string;
-  outcome?: string;
+  size?: number;         // Number of shares
+  usdcSize?: number;     // Cost in USDC
+  price?: number;        // Execution price (0-1)
+
+  // Timestamp - Unix timestamp in SECONDS (not ISO string!)
+  timestamp?: number;
+
+  // Market info
   title?: string;
+  slug?: string;
+  eventSlug?: string;
+  icon?: string;
+  outcome?: string;      // "Up", "Down", "Yes", "No"
+  outcomeIndex?: number; // 0 or 1
+
+  // User profile (not needed for copy trading)
+  name?: string;
+  pseudonym?: string;
 }
 
 /**
@@ -825,29 +842,41 @@ export class PolymarketAPI {
 
   private transformTrade(item: RawTradeResponse): Trade | null {
     try {
-      const id = item.id || item.taker_order_id || "";
-      const tokenId = item.asset || item.token_id || "";
+      // Only process TRADE type entries
+      if (item.type && item.type !== "TRADE") {
+        return null;
+      }
+
+      // Token ID is in the 'asset' field
+      const tokenId = item.asset || "";
+
+      // Use transactionHash as unique ID (actual API doesn't have 'id' field)
+      // Combine with timestamp and size for uniqueness across fills in same tx
+      const id = `${item.transactionHash || "unknown"}-${item.timestamp || 0}-${item.size || 0}`;
+
       const side = item.side || "BUY";
-
-      const rawSize = item.size;
-      const size = typeof rawSize === "string" ? parseFloat(rawSize) : rawSize || 0;
-
-      const rawPrice = item.price;
-      const price = typeof rawPrice === "string" ? parseFloat(rawPrice) : rawPrice || 0;
+      const size = item.size || 0;
+      const price = item.price || 0;
 
       if (!tokenId || size <= 0) {
         return null;
       }
 
+      // Timestamp is Unix seconds - convert to milliseconds for Date
+      // The API returns timestamps like 1769294618 (seconds since epoch)
+      const timestamp = item.timestamp
+        ? new Date(item.timestamp * 1000)
+        : new Date();
+
       return {
         id,
         tokenId,
-        marketId: item.market || "",
+        marketId: item.conditionId || "",  // conditionId is the market ID
         side,
         size,
         price,
-        timestamp: item.timestamp ? new Date(item.timestamp) : new Date(),
-        transactionHash: item.transaction_hash,
+        timestamp,
+        transactionHash: item.transactionHash,
         marketTitle: item.title,
         outcome: item.outcome,
       };

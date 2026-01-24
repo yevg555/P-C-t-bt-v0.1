@@ -13,7 +13,10 @@
  *   So to execute a BUY order, we need the ASK → call with side=SELL
  *   And to execute a SELL order, we need the BID → call with side=BUY
  *
- * Rate Limit: 15 requests/second
+ * Rate Limits (per 10 seconds):
+ *   - /activity endpoint: 1000 calls (100/sec) - 5x higher!
+ *   - /positions endpoint: 200 calls (20/sec)
+ *   - CLOB API: ~150 calls (15/sec)
  */
 
 import { Position, RawPositionResponse } from "../types";
@@ -109,9 +112,18 @@ export class PolymarketAPI {
   private dataApiUrl = "https://data-api.polymarket.com";
   private clobApiUrl = "https://clob.polymarket.com";
 
-  // Rate limiting
-  private lastRequestTime = 0;
-  private minRequestInterval = 67; // ~15 requests/sec max
+  // Differentiated rate limiting per endpoint type
+  // /activity: 1000 calls/10s = 100/sec = 10ms between requests
+  // /positions: 200 calls/10s = 20/sec = 50ms between requests
+  // CLOB API: ~150 calls/10s = 15/sec = 67ms between requests
+  private lastActivityRequestTime = 0;
+  private minActivityRequestInterval = 10; // 100 req/sec for /activity
+
+  private lastPositionsRequestTime = 0;
+  private minPositionsRequestInterval = 50; // 20 req/sec for /positions
+
+  private lastClobRequestTime = 0;
+  private minClobRequestInterval = 67; // 15 req/sec for CLOB API
 
   // Portfolio value cache: address -> cached value
   private portfolioValueCache: Map<string, CachedPortfolioValue> = new Map();
@@ -132,7 +144,7 @@ export class PolymarketAPI {
    * Includes curPrice from API!
    */
   async getPositions(address: string): Promise<Position[]> {
-    await this.respectRateLimit();
+    await this.respectPositionsRateLimit();
 
     const url = `${this.dataApiUrl}/positions?user=${address}`;
 
@@ -190,7 +202,7 @@ export class PolymarketAPI {
       }
     }
 
-    await this.respectRateLimit();
+    await this.respectPositionsRateLimit();
 
     const url = `${this.dataApiUrl}/value?user=${address}`;
 
@@ -315,7 +327,7 @@ export class PolymarketAPI {
     address: string,
     options: { limit?: number; after?: number } = {}
   ): Promise<Trade[]> {
-    await this.respectRateLimit();
+    await this.respectActivityRateLimit();
 
     const { limit = 100, after } = options;
 
@@ -442,7 +454,7 @@ export class PolymarketAPI {
       }
     }
 
-    await this.respectRateLimit();
+    await this.respectClobRateLimit();
 
     // FLIP THE SIDE!
     // To BUY, we need sellers (ASK) → API side=SELL
@@ -569,7 +581,7 @@ export class PolymarketAPI {
    * Use this if you want the raw API behavior
    */
   async getRawPrice(tokenId: string, side: "BUY" | "SELL"): Promise<number> {
-    await this.respectRateLimit();
+    await this.respectClobRateLimit();
 
     const url = `${this.clobApiUrl}/price?token_id=${tokenId}&side=${side}`;
 
@@ -591,7 +603,7 @@ export class PolymarketAPI {
    * Good for estimation, NOT for execution
    */
   async getMidpoint(tokenId: string): Promise<number> {
-    await this.respectRateLimit();
+    await this.respectClobRateLimit();
 
     const url = `${this.clobApiUrl}/midpoint?token_id=${tokenId}`;
 
@@ -612,7 +624,7 @@ export class PolymarketAPI {
    * Get spread directly from API
    */
   async getSpread(tokenId: string): Promise<number> {
-    await this.respectRateLimit();
+    await this.respectClobRateLimit();
 
     const url = `${this.clobApiUrl}/spread?token_id=${tokenId}`;
 
@@ -636,7 +648,7 @@ export class PolymarketAPI {
     bids: Array<{ price: string; size: string }>;
     asks: Array<{ price: string; size: string }>;
   }> {
-    await this.respectRateLimit();
+    await this.respectClobRateLimit();
 
     const url = `${this.clobApiUrl}/book?token_id=${tokenId}`;
 
@@ -661,16 +673,58 @@ export class PolymarketAPI {
   // HELPER METHODS
   // ===================================
 
-  private async respectRateLimit(): Promise<void> {
+  /**
+   * Rate limit for /activity endpoint (1000 calls/10s = 100/sec)
+   * 5x higher limits than positions!
+   */
+  private async respectActivityRateLimit(): Promise<void> {
     const now = Date.now();
-    const timeSinceLastRequest = now - this.lastRequestTime;
+    const timeSinceLastRequest = now - this.lastActivityRequestTime;
 
-    if (timeSinceLastRequest < this.minRequestInterval) {
-      const waitTime = this.minRequestInterval - timeSinceLastRequest;
+    if (timeSinceLastRequest < this.minActivityRequestInterval) {
+      const waitTime = this.minActivityRequestInterval - timeSinceLastRequest;
       await this.sleep(waitTime);
     }
 
-    this.lastRequestTime = Date.now();
+    this.lastActivityRequestTime = Date.now();
+  }
+
+  /**
+   * Rate limit for /positions endpoint (200 calls/10s = 20/sec)
+   */
+  private async respectPositionsRateLimit(): Promise<void> {
+    const now = Date.now();
+    const timeSinceLastRequest = now - this.lastPositionsRequestTime;
+
+    if (timeSinceLastRequest < this.minPositionsRequestInterval) {
+      const waitTime = this.minPositionsRequestInterval - timeSinceLastRequest;
+      await this.sleep(waitTime);
+    }
+
+    this.lastPositionsRequestTime = Date.now();
+  }
+
+  /**
+   * Rate limit for CLOB API (prices, orderbook) (~150 calls/10s = 15/sec)
+   */
+  private async respectClobRateLimit(): Promise<void> {
+    const now = Date.now();
+    const timeSinceLastRequest = now - this.lastClobRequestTime;
+
+    if (timeSinceLastRequest < this.minClobRequestInterval) {
+      const waitTime = this.minClobRequestInterval - timeSinceLastRequest;
+      await this.sleep(waitTime);
+    }
+
+    this.lastClobRequestTime = Date.now();
+  }
+
+  /**
+   * @deprecated Use endpoint-specific rate limiters instead
+   */
+  private async respectRateLimit(): Promise<void> {
+    // Fallback to positions rate limit for backward compatibility
+    await this.respectPositionsRateLimit();
   }
 
   private transformPositions(data: unknown): Position[] {

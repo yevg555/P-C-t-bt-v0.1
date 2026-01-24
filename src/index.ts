@@ -16,7 +16,8 @@
 import * as dotenv from "dotenv";
 import * as readline from "readline";
 import { PositionPoller } from "./polling";
-import { PolymarketAPI } from "./api/polymarket-api";
+import { ActivityPoller, TradeEvent } from "./polling/activity-poller";
+import { PolymarketAPI, Trade } from "./api/polymarket-api";
 import { CopySizeCalculator } from "./strategy/copy-size";
 import { RiskChecker, TradingState } from "./strategy/risk-checker";
 import { PriceAdjuster } from "./strategy/price-adjuster";
@@ -37,6 +38,18 @@ import {
   TraderConfig,
 } from "./types";
 
+/**
+ * Polling method determines how we detect trader's trades
+ * - 'activity': Poll /activity endpoint for actual trades (recommended)
+ *   - Exact timestamps for latency measurement
+ *   - Exact execution prices
+ *   - Incremental fetching with `after` parameter
+ * - 'positions': Poll /positions endpoint and diff (legacy)
+ *   - State-based change detection
+ *   - No exact trade timestamps
+ */
+type PollingMethod = "activity" | "positions";
+
 // Load environment variables
 dotenv.config();
 
@@ -44,7 +57,11 @@ dotenv.config();
  * Main bot class that orchestrates all components
  */
 class CopyTradingBot {
-  private poller: PositionPoller;
+  // Polling - supports both activity-based and position-based
+  private pollingMethod: PollingMethod;
+  private positionPoller: PositionPoller | null = null;
+  private activityPoller: ActivityPoller | null = null;
+
   private api: PolymarketAPI;
   private sizeCalculator: CopySizeCalculator;
   private riskChecker: RiskChecker;
@@ -66,6 +83,14 @@ class CopyTradingBot {
   private dailyPnL: number = 0;
   private totalPnL: number = 0;
   private tradeCount: number = 0;
+
+  // Latency tracking
+  private latencySamples: Array<{
+    detectionLatencyMs: number;
+    executionLatencyMs: number;
+    totalLatencyMs: number;
+  }> = [];
+  private maxLatencySamples: number = 100;
 
   constructor() {
     // Validate config
@@ -95,13 +120,22 @@ class CopyTradingBot {
     // Initialize components
     this.api = new PolymarketAPI();
 
-    this.poller = new PositionPoller({
+    // Choose polling method: activity (recommended) or positions (legacy)
+    this.pollingMethod = (process.env.POLLING_METHOD as PollingMethod) || "activity";
+
+    const pollerConfig = {
       traderAddress,
       intervalMs,
       maxConsecutiveErrors: parseInt(
         process.env.MAX_CONSECUTIVE_ERRORS || "5"
       ),
-    });
+    };
+
+    if (this.pollingMethod === "activity") {
+      this.activityPoller = new ActivityPoller(pollerConfig, this.api);
+    } else {
+      this.positionPoller = new PositionPoller(pollerConfig);
+    }
 
     this.sizeCalculator = new CopySizeCalculator({
       sizingMethod:
@@ -162,31 +196,259 @@ class CopyTradingBot {
    * Set up event handlers for the poller
    */
   private setupEventHandlers(): void {
-    // Main event: when trader's position changes
-    this.poller.on("change", async (change: PositionChange) => {
-      await this.handlePositionChange(change);
-    });
+    if (this.activityPoller) {
+      // Activity-based polling (recommended)
+      this.activityPoller.on("trade", async (event: TradeEvent) => {
+        await this.handleTradeEvent(event);
+      });
 
-    this.poller.on("error", (error: Error) => {
-      console.error(`[BOT] Poller error: ${error.message}`);
-    });
+      this.activityPoller.on("error", (error: Error) => {
+        console.error(`[BOT] Poller error: ${error.message}`);
+      });
 
-    this.poller.on("degraded", (errorCount: number) => {
-      console.log("");
-      console.log("WARNING: Bot is in degraded state");
-      console.log("   Check your internet connection and API status");
-      console.log(`   Consecutive errors: ${errorCount}`);
-      console.log("");
-    });
+      this.activityPoller.on("degraded", (errorCount: number) => {
+        console.log("");
+        console.log("WARNING: Bot is in degraded state");
+        console.log("   Check your internet connection and API status");
+        console.log(`   Consecutive errors: ${errorCount}`);
+        console.log("");
+      });
 
-    this.poller.on("recovered", () => {
-      console.log("[BOT] Poller recovered from errors");
-    });
+      this.activityPoller.on("recovered", () => {
+        console.log("[BOT] Poller recovered from errors");
+      });
+    } else if (this.positionPoller) {
+      // Position-based polling (legacy)
+      this.positionPoller.on("change", async (change: PositionChange) => {
+        await this.handlePositionChange(change);
+      });
+
+      this.positionPoller.on("error", (error: Error) => {
+        console.error(`[BOT] Poller error: ${error.message}`);
+      });
+
+      this.positionPoller.on("degraded", (errorCount: number) => {
+        console.log("");
+        console.log("WARNING: Bot is in degraded state");
+        console.log("   Check your internet connection and API status");
+        console.log(`   Consecutive errors: ${errorCount}`);
+        console.log("");
+      });
+
+      this.positionPoller.on("recovered", () => {
+        console.log("[BOT] Poller recovered from errors");
+      });
+    }
 
     // TP/SL trigger handler
     this.tpSlMonitor.on("trigger", async (event: TpSlTriggerEvent) => {
       await this.handleTpSlTrigger(event);
     });
+  }
+
+  /**
+   * Handle a trade event from the ActivityPoller
+   * This is the recommended method - provides exact timestamps and prices
+   */
+  private async handleTradeEvent(event: TradeEvent): Promise<void> {
+    const { trade, latency } = event;
+    const executionStartTime = Date.now();
+    const traderTag = this.traderConfig.tag || this.traderConfig.address.slice(0, 10);
+
+    console.log("");
+    console.log("=".repeat(60));
+    console.log(`[${traderTag}] TRADE DETECTED: ${trade.side} ${trade.size.toFixed(2)} shares @ $${trade.price.toFixed(4)}`);
+    console.log(`Token: ${trade.tokenId.slice(0, 20)}...`);
+    if (trade.marketTitle) {
+      console.log(`Market: ${trade.marketTitle}`);
+    }
+    console.log(`Trade Time: ${trade.timestamp.toISOString()}`);
+    console.log(`Detection Latency: ${latency.detectionLatencyMs}ms`);
+    console.log("=".repeat(60));
+
+    // Convert Trade to PositionChange for compatibility with existing code
+    // For activity polling, we use the actual trade data
+    const change: PositionChange = {
+      tokenId: trade.tokenId,
+      marketId: trade.marketId,
+      side: trade.side,
+      delta: trade.size,
+      // For activity polling, we don't have the previous/current position quantities
+      // Use the trade size as delta
+      previousQuantity: trade.side === "BUY" ? 0 : trade.size,
+      currentQuantity: trade.side === "BUY" ? trade.size : 0,
+      detectedAt: latency.detectedAt,
+      marketTitle: trade.marketTitle,
+      curPrice: trade.price,
+    };
+
+    // Get our current position in this token (needed for SELL calculations)
+    const yourPosition = await this.executor.getPosition(trade.tokenId);
+
+    // Step 1: Should we copy this trade?
+    const shouldCopy = this.sizeCalculator.shouldCopy(change, yourPosition);
+    if (!shouldCopy.copy) {
+      console.log(`[SKIP] ${shouldCopy.reason}`);
+      return;
+    }
+
+    // Step 2: Use the exact trade price from the API (more accurate than fetching)
+    // For BUY, we want to pay ≤ trader's price; for SELL, receive ≥ trader's price
+    let currentPrice = trade.price;
+    console.log(`[PRICE] Trader's execution price: $${currentPrice.toFixed(4)}`);
+
+    // Optionally fetch current market price for comparison
+    try {
+      const marketPrice = await this.api.getPrice(trade.tokenId, trade.side);
+      const priceDiff = ((marketPrice - trade.price) / trade.price * 100).toFixed(2);
+      console.log(`[PRICE] Current market price: $${marketPrice.toFixed(4)} (${priceDiff}% from trade)`);
+      // Use market price for execution (more current)
+      currentPrice = marketPrice;
+    } catch {
+      // Fall back to trade price if market price fetch fails
+      console.log(`[PRICE] Using trader's execution price (market fetch failed)`);
+    }
+
+    // Step 3: Calculate copy size
+    const balance = await this.executor.getBalance();
+
+    // Get trader portfolio value for proportional_to_trader sizing
+    let traderPortfolioValue: number | undefined =
+      this.api.getCachedPortfolioValue(this.traderConfig.address);
+
+    if (traderPortfolioValue === undefined) {
+      try {
+        traderPortfolioValue = await this.api.getPortfolioValue(this.traderConfig.address);
+      } catch (error) {
+        console.warn(`[SIZE] Could not get trader portfolio value: ${error}`);
+      }
+    }
+
+    const sizeResult = this.sizeCalculator.calculate({
+      change,
+      currentPrice,
+      yourBalance: balance,
+      yourPosition,
+      traderPortfolioValue,
+    });
+
+    console.log(`[SIZE] ${sizeResult.reason}`);
+    if (sizeResult.adjustments.length > 0) {
+      sizeResult.adjustments.forEach((adj) => console.log(`  - ${adj}`));
+    }
+
+    if (sizeResult.shares === 0) {
+      console.log("[SKIP] Calculated size is 0");
+      return;
+    }
+
+    // Step 4: Adjust price for better fill
+    const adjustedPrice = this.priceAdjuster.adjust(currentPrice, trade.side);
+    const priceDetails = this.priceAdjuster.getAdjustmentDetails(
+      currentPrice,
+      trade.side,
+      sizeResult.shares
+    );
+    console.log(`[PRICE] ${priceDetails.description}`);
+
+    // Step 5: Create order spec
+    const orderConfig = this.sizeCalculator.getOrderConfig();
+    const expiresInMs = orderConfig.expirationSeconds * 1000;
+
+    const order: OrderSpec = {
+      tokenId: trade.tokenId,
+      side: trade.side,
+      size: sizeResult.shares,
+      price: adjustedPrice,
+      orderType: orderConfig.orderType,
+      expiresInMs: expiresInMs > 0 ? expiresInMs : undefined,
+      expiresAt: expiresInMs > 0 ? new Date(Date.now() + expiresInMs) : undefined,
+      priceOffsetBps: orderConfig.priceOffsetBps,
+      triggeredBy: change,
+    };
+
+    console.log(`[ORDER] Type: ${order.orderType?.toUpperCase()}, Expires: ${order.expiresInMs ? `${orderConfig.expirationSeconds}s` : 'GTC'}`);
+
+    // Step 6: Risk check
+    const tradingState = await this.getTradingState();
+    const riskResult = this.riskChecker.check(order, tradingState);
+
+    if (!riskResult.approved) {
+      console.log(`[RISK] REJECTED: ${riskResult.reason}`);
+      return;
+    }
+
+    if (riskResult.warnings.length > 0) {
+      console.log(`[RISK] Warnings:`);
+      riskResult.warnings.forEach((w) => console.log(`  - ${w}`));
+    }
+
+    console.log(`[RISK] Approved (level: ${riskResult.riskLevel})`);
+
+    // Step 7: Execute the order
+    console.log(`[EXEC] Executing ${order.side} ${order.size} @ $${order.price.toFixed(4)}...`);
+
+    try {
+      const result = await this.executor.execute(order);
+
+      const executionEndTime = Date.now();
+      const executionLatencyMs = executionEndTime - executionStartTime;
+      const totalLatencyMs = executionEndTime - trade.timestamp.getTime();
+
+      // Record latency sample
+      this.recordLatencySample(latency.detectionLatencyMs, executionLatencyMs, totalLatencyMs);
+
+      if (result.status === "filled") {
+        this.tradeCount++;
+        console.log(`[EXEC] FILLED: ${result.filledSize} shares @ $${result.avgFillPrice?.toFixed(4) || order.price.toFixed(4)}`);
+        console.log(`[EXEC] Order ID: ${result.orderId}`);
+        console.log(`[EXEC] Mode: ${result.executionMode.toUpperCase()}`);
+        console.log(`[LATENCY] Detection: ${latency.detectionLatencyMs}ms | Execution: ${executionLatencyMs}ms | Total: ${totalLatencyMs}ms`);
+      } else {
+        console.log(`[EXEC] ${result.status.toUpperCase()}: ${result.error || "Unknown error"}`);
+      }
+    } catch (error) {
+      console.error(`[EXEC] Execution failed: ${error}`);
+    }
+
+    console.log("=".repeat(60));
+    console.log("");
+  }
+
+  /**
+   * Record a latency sample for statistics
+   */
+  private recordLatencySample(detectionLatencyMs: number, executionLatencyMs: number, totalLatencyMs: number): void {
+    this.latencySamples.push({ detectionLatencyMs, executionLatencyMs, totalLatencyMs });
+    if (this.latencySamples.length > this.maxLatencySamples) {
+      this.latencySamples.shift();
+    }
+  }
+
+  /**
+   * Get latency statistics
+   */
+  getLatencyStats(): {
+    avgDetectionMs: number;
+    avgExecutionMs: number;
+    avgTotalMs: number;
+    sampleCount: number;
+  } {
+    if (this.latencySamples.length === 0) {
+      return { avgDetectionMs: 0, avgExecutionMs: 0, avgTotalMs: 0, sampleCount: 0 };
+    }
+
+    const sumDetection = this.latencySamples.reduce((a, b) => a + b.detectionLatencyMs, 0);
+    const sumExecution = this.latencySamples.reduce((a, b) => a + b.executionLatencyMs, 0);
+    const sumTotal = this.latencySamples.reduce((a, b) => a + b.totalLatencyMs, 0);
+    const count = this.latencySamples.length;
+
+    return {
+      avgDetectionMs: Math.round(sumDetection / count),
+      avgExecutionMs: Math.round(sumExecution / count),
+      avgTotalMs: Math.round(sumTotal / count),
+      sampleCount: count,
+    };
   }
 
   /**
@@ -417,6 +679,7 @@ class CopyTradingBot {
 
     console.log(`  Mode:            ${getTradingMode().toUpperCase()}`);
     console.log(`  Trader:          ${traderDisplay}`);
+    console.log(`  Polling Method:  ${this.pollingMethod.toUpperCase()}`);
     console.log(`  Poll Interval:   ${process.env.POLLING_INTERVAL_MS || 1000}ms`);
     console.log(`  Sizing:          ${process.env.SIZING_METHOD || "proportional_to_portfolio"}`);
     console.log(`  Portfolio %:     ${(parseFloat(process.env.PORTFOLIO_PERCENTAGE || "0.05") * 100).toFixed(1)}%`);
@@ -454,7 +717,12 @@ class CopyTradingBot {
     console.log(`  1-Click Sell:     ${this.oneClickSellEnabled ? "ENABLED (press 'q')" : "DISABLED"}`);
     console.log("");
 
-    await this.poller.start();
+    // Start the appropriate poller
+    if (this.activityPoller) {
+      await this.activityPoller.start();
+    } else if (this.positionPoller) {
+      await this.positionPoller.start();
+    }
 
     // Prefetch trader portfolio value and start periodic refresh
     // This ensures low latency for proportional_to_trader sizing
@@ -595,7 +863,11 @@ class CopyTradingBot {
    * Stop the bot
    */
   stop(): void {
-    this.poller.stop();
+    if (this.activityPoller) {
+      this.activityPoller.stop();
+    } else if (this.positionPoller) {
+      this.positionPoller.stop();
+    }
     this.tpSlMonitor.stopMonitoring();
 
     // Stop portfolio value prefetching
@@ -614,18 +886,35 @@ class CopyTradingBot {
    * Get bot statistics
    */
   getStats(): {
-    pollerStats: ReturnType<PositionPoller["getStats"]>;
+    pollerStats: ReturnType<PositionPoller["getStats"]> | ReturnType<ActivityPoller["getStats"]>;
     tradeCount: number;
     totalPnL: number;
     dailyPnL: number;
     mode: string;
+    pollingMethod: PollingMethod;
+    latencyStats: ReturnType<CopyTradingBot["getLatencyStats"]>;
   } {
+    const pollerStats = this.activityPoller
+      ? this.activityPoller.getStats()
+      : this.positionPoller?.getStats() || {
+          isRunning: false,
+          isPaused: false,
+          pollCount: 0,
+          changesDetected: 0,
+          cacheSize: 0,
+          consecutiveErrors: 0,
+          lastPollTime: null,
+          traderAddress: this.traderConfig.address,
+        };
+
     return {
-      pollerStats: this.poller.getStats(),
+      pollerStats,
       tradeCount: this.tradeCount,
       totalPnL: this.totalPnL,
       dailyPnL: this.dailyPnL,
       mode: getTradingMode(),
+      pollingMethod: this.pollingMethod,
+      latencyStats: this.getLatencyStats(),
     };
   }
 
@@ -651,15 +940,24 @@ async function main() {
     bot.stop();
 
     const stats = bot.getStats();
+    const pollerStats = stats.pollerStats;
+    const tradesDetected = 'tradesDetected' in pollerStats
+      ? pollerStats.tradesDetected
+      : ('changesDetected' in pollerStats ? pollerStats.changesDetected : 0);
+
     console.log("");
     console.log("╔═══════════════════════════════════════════════════════════╗");
     console.log("║                   SESSION SUMMARY                         ║");
     console.log("╠═══════════════════════════════════════════════════════════╣");
     console.log(`║  Mode:              ${stats.mode.toUpperCase().padEnd(38)}║`);
-    console.log(`║  Polls completed:   ${String(stats.pollerStats.pollCount).padEnd(38)}║`);
-    console.log(`║  Changes detected:  ${String(stats.pollerStats.changesDetected).padEnd(38)}║`);
+    console.log(`║  Polling Method:    ${stats.pollingMethod.toUpperCase().padEnd(38)}║`);
+    console.log(`║  Polls completed:   ${String(pollerStats.pollCount).padEnd(38)}║`);
+    console.log(`║  Trades detected:   ${String(tradesDetected).padEnd(38)}║`);
     console.log(`║  Trades executed:   ${String(stats.tradeCount).padEnd(38)}║`);
     console.log(`║  Total P&L:         $${stats.totalPnL.toFixed(2).padEnd(36)}║`);
+    if (stats.latencyStats.sampleCount > 0) {
+      console.log(`║  Avg Latency:       ${String(stats.latencyStats.avgTotalMs + 'ms').padEnd(38)}║`);
+    }
     console.log("╚═══════════════════════════════════════════════════════════╝");
 
     // If paper trading, show detailed summary

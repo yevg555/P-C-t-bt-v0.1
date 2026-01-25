@@ -14,7 +14,10 @@ async function checkClockSync() {
     const localBefore = Date.now();
 
     // Fetch from Polymarket API
-    const response = await fetch('https://data-api.polymarket.com/activity?limit=1');
+    const response = await fetch('https://data-api.polymarket.com/activity?limit=1', {
+      method: 'GET',
+      headers: { 'Accept': 'application/json' }
+    });
 
     const localAfter = Date.now();
     const serverDateHeader = response.headers.get('date');
@@ -24,16 +27,16 @@ async function checkClockSync() {
       return;
     }
 
-    const polymarketTime = new Date(serverDateHeader).getTime();
+    const serverTime = new Date(serverDateHeader);
     const localAvg = (localBefore + localAfter) / 2; // Adjust for network RTT
     const networkLatency = localAfter - localBefore;
-    const drift = localAvg - polymarketTime;
+    const drift = localAvg - serverTime.getTime();
 
     console.log('╔════════════════════════════════════════════════════════════╗');
     console.log('║         CLOCK SYNCHRONIZATION CHECK                        ║');
     console.log('╠════════════════════════════════════════════════════════════╣');
     console.log(`║  Your System Time:       ${new Date(localBefore).toISOString()}  ║`);
-    console.log(`║  Polymarket Server:      ${new Date(polymarketTime).toISOString()}  ║`);
+    console.log(`║  Polymarket Server:      ${serverTime.toISOString()}  ║`);
     console.log('╠════════════════════════════════════════════════════════════╣');
     console.log(`║  Network Latency:        ${networkLatency.toString().padStart(4)}ms                             ║`);
     console.log(`║  Clock Drift:            ${drift >= 0 ? '+' : ''}${drift.toFixed(1).padStart(5)}ms                           ║`);

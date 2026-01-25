@@ -727,6 +727,11 @@ class CopyTradingBot {
     console.log(`  1-Click Sell:     ${this.oneClickSellEnabled ? "ENABLED (press 'q')" : "DISABLED"}`);
     console.log("");
 
+    // Run startup tests
+    console.log("  --- Startup Tests ---");
+    await this.runStartupTests();
+    console.log("");
+
     // Start the appropriate poller
     if (this.activityPoller) {
       await this.activityPoller.start();
@@ -750,6 +755,47 @@ class CopyTradingBot {
 
     console.log("Press Ctrl+C to stop" + (this.oneClickSellEnabled ? ", 'q' to sell all positions" : ""));
     console.log("");
+  }
+
+  /**
+   * Run startup tests to validate system readiness
+   */
+  private async runStartupTests(): Promise<void> {
+    // Test 1: Clock Synchronization
+    try {
+      const clockSync = await this.api.checkClockSync();
+
+      if (clockSync.synchronized) {
+        console.log(`  Clock Sync:       ✅ SYNCHRONIZED (drift: ${clockSync.drift >= 0 ? '+' : ''}${clockSync.drift.toFixed(1)}ms)`);
+      } else {
+        const driftAbs = Math.abs(clockSync.drift);
+        if (driftAbs < 500) {
+          console.log(`  Clock Sync:       ⚠️  WARNING (drift: ${clockSync.drift >= 0 ? '+' : ''}${clockSync.drift.toFixed(1)}ms)`);
+          console.log(`                    Latency measurements may be off by ~${driftAbs.toFixed(0)}ms`);
+        } else if (driftAbs < 2000) {
+          console.log(`  Clock Sync:       ⚠️  SIGNIFICANT DRIFT (${clockSync.drift >= 0 ? '+' : ''}${clockSync.drift.toFixed(1)}ms)`);
+          console.log(`                    ACTION: Sync system clock with NTP`);
+        } else {
+          console.log(`  Clock Sync:       ❌ CRITICAL (drift: ${clockSync.drift >= 0 ? '+' : ''}${(clockSync.drift/1000).toFixed(2)}s)`);
+          console.log(`                    Latency measurements are UNRELIABLE!`);
+          console.log(`                    Run: sudo ntpdate -s time.nist.gov`);
+        }
+      }
+    } catch (error) {
+      console.log(`  Clock Sync:       ⚠️  UNABLE TO CHECK`);
+      console.log(`                    ${error instanceof Error ? error.message : String(error)}`);
+    }
+
+    // Test 2: API Connectivity (already tested by clock sync, just report it)
+    try {
+      // Quick connectivity test
+      await this.api.getTrades(this.traderConfig.address, { limit: 1 });
+      console.log(`  API Connectivity: ✅ OK`);
+    } catch (error) {
+      console.log(`  API Connectivity: ❌ FAILED`);
+      console.log(`                    ${error instanceof Error ? error.message : String(error)}`);
+      throw new Error("API connectivity test failed. Cannot start bot.");
+    }
   }
 
   /**

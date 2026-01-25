@@ -813,6 +813,65 @@ export class PolymarketAPI {
   }
 
   // ===================================
+  // CLOCK SYNCHRONIZATION
+  // ===================================
+
+  /**
+   * Check clock synchronization with Polymarket servers
+   * Returns drift in milliseconds and synchronization status
+   *
+   * This is critical for accurate latency measurements in copy trading.
+   * Detection latency is calculated as: Date.now() - trade.timestamp
+   * If clocks are not synchronized, measurements will be inaccurate.
+   *
+   * @returns Object with drift (ms), network latency, and sync status
+   */
+  async checkClockSync(): Promise<{
+    drift: number;
+    networkLatency: number;
+    synchronized: boolean;
+    localTime: Date;
+    serverTime: Date;
+  }> {
+    const localBefore = Date.now();
+
+    try {
+      // Fetch from Polymarket API to get server time
+      const response = await fetch(`${this.dataApiUrl}/activity?limit=1`, {
+        method: "GET",
+        headers: { Accept: "application/json" },
+      });
+
+      const localAfter = Date.now();
+      const serverDateHeader = response.headers.get("date");
+
+      if (!serverDateHeader) {
+        throw new Error("No Date header in response");
+      }
+
+      const serverTime = new Date(serverDateHeader);
+      const networkLatency = localAfter - localBefore;
+
+      // Adjust for network round-trip time (half RTT is approximate one-way latency)
+      const localAvg = (localBefore + localAfter) / 2;
+      const drift = localAvg - serverTime.getTime();
+
+      // Synchronized if drift is within 100ms
+      const synchronized = Math.abs(drift) < 100;
+
+      return {
+        drift,
+        networkLatency,
+        synchronized,
+        localTime: new Date(localAvg),
+        serverTime,
+      };
+    } catch (error) {
+      throw new Error(`Clock sync check failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  // ===================================
   // TRADE TRANSFORMATION
   // ===================================
 

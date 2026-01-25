@@ -76,6 +76,9 @@ class CopyTradingBot {
   private oneClickSellEnabled: boolean;
   private keyboardListener: readline.Interface | null = null;
 
+  // Price optimization: skip market price fetch when using activity polling
+  private useTraderPrice: boolean;
+
   // Portfolio value prefetch interval
   private portfolioValuePrefetchInterval: NodeJS.Timeout | null = null;
 
@@ -189,6 +192,10 @@ class CopyTradingBot {
     // 1-Click Sell configuration
     this.oneClickSellEnabled = process.env.ONE_CLICK_SELL_ENABLED !== "false";
 
+    // Price optimization: use trader's execution price instead of fetching market price
+    // Only effective when using activity polling (which provides exact trade prices)
+    this.useTraderPrice = process.env.USE_TRADER_PRICE === "true";
+
     this.setupEventHandlers();
   }
 
@@ -292,21 +299,24 @@ class CopyTradingBot {
       return;
     }
 
-    // Step 2: Use the exact trade price from the API (more accurate than fetching)
-    // For BUY, we want to pay ≤ trader's price; for SELL, receive ≥ trader's price
+    // Step 2: Determine price to use for our order
+    // We have the trader's exact execution price from the /activity endpoint
     let currentPrice = trade.price;
     console.log(`[PRICE] Trader's execution price: $${currentPrice.toFixed(4)}`);
 
-    // Optionally fetch current market price for comparison
-    try {
-      const marketPrice = await this.api.getPrice(trade.tokenId, trade.side);
-      const priceDiff = ((marketPrice - trade.price) / trade.price * 100).toFixed(2);
-      console.log(`[PRICE] Current market price: $${marketPrice.toFixed(4)} (${priceDiff}% from trade)`);
-      // Use market price for execution (more current)
-      currentPrice = marketPrice;
-    } catch {
-      // Fall back to trade price if market price fetch fails
-      console.log(`[PRICE] Using trader's execution price (market fetch failed)`);
+    if (this.useTraderPrice) {
+      // Use trader's price directly - saves ~67ms by skipping CLOB API call
+      console.log(`[PRICE] Using trader's price (USE_TRADER_PRICE=true)`);
+    } else {
+      // Fetch current market price for potentially better execution
+      try {
+        const marketPrice = await this.api.getPrice(trade.tokenId, trade.side);
+        const priceDiff = ((marketPrice - trade.price) / trade.price * 100).toFixed(2);
+        console.log(`[PRICE] Current market price: $${marketPrice.toFixed(4)} (${priceDiff}% from trade)`);
+        currentPrice = marketPrice;
+      } catch {
+        console.log(`[PRICE] Using trader's price (market fetch failed)`);
+      }
     }
 
     // Step 3: Calculate copy size

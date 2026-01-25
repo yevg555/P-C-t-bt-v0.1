@@ -95,6 +95,9 @@ class CopyTradingBot {
   }> = [];
   private maxLatencySamples: number = 100;
 
+  // Clock drift calibration (measured on startup)
+  private clockDriftOffset: number = 0;
+
   constructor() {
     // Validate config
     const traderAddress = process.env.TRADER_ADDRESS;
@@ -270,7 +273,14 @@ class CopyTradingBot {
       console.log(`Market: ${trade.marketTitle}`);
     }
     console.log(`Trade Time: ${trade.timestamp.toISOString()}`);
-    console.log(`Detection Latency: ${latency.detectionLatencyMs}ms`);
+
+    // Show calibrated detection latency if drift correction is significant
+    if (Math.abs(this.clockDriftOffset) > 1) {
+      const detectionLatencyCorrected = latency.detectionLatencyMs - this.clockDriftOffset;
+      console.log(`Detection Latency: ${detectionLatencyCorrected.toFixed(0)}ms (calibrated, raw: ${latency.detectionLatencyMs}ms)`);
+    } else {
+      console.log(`Detection Latency: ${latency.detectionLatencyMs}ms`);
+    }
     console.log("=".repeat(60));
 
     // Convert Trade to PositionChange for compatibility with existing code
@@ -405,15 +415,25 @@ class CopyTradingBot {
       const executionLatencyMs = executionEndTime - executionStartTime;
       const totalLatencyMs = executionEndTime - trade.timestamp.getTime();
 
-      // Record latency sample
-      this.recordLatencySample(latency.detectionLatencyMs, executionLatencyMs, totalLatencyMs);
+      // Apply clock drift calibration
+      const detectionLatencyCorrected = latency.detectionLatencyMs - this.clockDriftOffset;
+      const totalLatencyCorrected = totalLatencyMs - this.clockDriftOffset;
+
+      // Record latency sample (use corrected values)
+      this.recordLatencySample(detectionLatencyCorrected, executionLatencyMs, totalLatencyCorrected);
 
       if (result.status === "filled") {
         this.tradeCount++;
         console.log(`[EXEC] FILLED: ${result.filledSize} shares @ $${result.avgFillPrice?.toFixed(4) || order.price.toFixed(4)}`);
         console.log(`[EXEC] Order ID: ${result.orderId}`);
         console.log(`[EXEC] Mode: ${result.executionMode.toUpperCase()}`);
-        console.log(`[LATENCY] Detection: ${latency.detectionLatencyMs}ms | Execution: ${executionLatencyMs}ms | Total: ${totalLatencyMs}ms`);
+
+        // Show calibrated latency
+        if (Math.abs(this.clockDriftOffset) > 1) {
+          console.log(`[LATENCY] Detection: ${detectionLatencyCorrected.toFixed(0)}ms | Execution: ${executionLatencyMs}ms | Total: ${totalLatencyCorrected.toFixed(0)}ms (calibrated)`);
+        } else {
+          console.log(`[LATENCY] Detection: ${latency.detectionLatencyMs}ms | Execution: ${executionLatencyMs}ms | Total: ${totalLatencyMs}ms`);
+        }
       } else {
         console.log(`[EXEC] ${result.status.toUpperCase()}: ${result.error || "Unknown error"}`);
       }
@@ -436,16 +456,23 @@ class CopyTradingBot {
   }
 
   /**
-   * Get latency statistics
+   * Get latency statistics (already calibrated with clock drift offset)
    */
   getLatencyStats(): {
     avgDetectionMs: number;
     avgExecutionMs: number;
     avgTotalMs: number;
     sampleCount: number;
+    clockDriftOffset: number;
   } {
     if (this.latencySamples.length === 0) {
-      return { avgDetectionMs: 0, avgExecutionMs: 0, avgTotalMs: 0, sampleCount: 0 };
+      return {
+        avgDetectionMs: 0,
+        avgExecutionMs: 0,
+        avgTotalMs: 0,
+        sampleCount: 0,
+        clockDriftOffset: this.clockDriftOffset,
+      };
     }
 
     const sumDetection = this.latencySamples.reduce((a, b) => a + b.detectionLatencyMs, 0);
@@ -458,6 +485,7 @@ class CopyTradingBot {
       avgExecutionMs: Math.round(sumExecution / count),
       avgTotalMs: Math.round(sumTotal / count),
       sampleCount: count,
+      clockDriftOffset: this.clockDriftOffset,
     };
   }
 
@@ -765,25 +793,34 @@ class CopyTradingBot {
     try {
       const clockSync = await this.api.checkClockSync();
 
+      // Store the drift offset for automatic calibration
+      this.clockDriftOffset = clockSync.drift;
+
       if (clockSync.synchronized) {
         console.log(`  Clock Sync:       ✅ SYNCHRONIZED (drift: ${clockSync.drift >= 0 ? '+' : ''}${clockSync.drift.toFixed(1)}ms)`);
+        if (Math.abs(clockSync.drift) > 10) {
+          console.log(`                    Auto-calibration enabled - latency adjusted by ${clockSync.drift >= 0 ? '+' : ''}${clockSync.drift.toFixed(1)}ms`);
+        }
       } else {
         const driftAbs = Math.abs(clockSync.drift);
         if (driftAbs < 500) {
           console.log(`  Clock Sync:       ⚠️  WARNING (drift: ${clockSync.drift >= 0 ? '+' : ''}${clockSync.drift.toFixed(1)}ms)`);
-          console.log(`                    Latency measurements may be off by ~${driftAbs.toFixed(0)}ms`);
+          console.log(`                    Auto-calibration enabled - measurements will be corrected`);
         } else if (driftAbs < 2000) {
           console.log(`  Clock Sync:       ⚠️  SIGNIFICANT DRIFT (${clockSync.drift >= 0 ? '+' : ''}${clockSync.drift.toFixed(1)}ms)`);
-          console.log(`                    ACTION: Sync system clock with NTP`);
+          console.log(`                    Auto-calibration enabled, but recommend syncing clock`);
+          console.log(`                    Run: sudo ntpdate -s time.nist.gov`);
         } else {
           console.log(`  Clock Sync:       ❌ CRITICAL (drift: ${clockSync.drift >= 0 ? '+' : ''}${(clockSync.drift/1000).toFixed(2)}s)`);
-          console.log(`                    Latency measurements are UNRELIABLE!`);
-          console.log(`                    Run: sudo ntpdate -s time.nist.gov`);
+          console.log(`                    Auto-calibration may not be accurate with large drift!`);
+          console.log(`                    URGENT: Run: sudo ntpdate -s time.nist.gov`);
         }
       }
     } catch (error) {
       console.log(`  Clock Sync:       ⚠️  UNABLE TO CHECK`);
       console.log(`                    ${error instanceof Error ? error.message : String(error)}`);
+      console.log(`                    Auto-calibration disabled - drift offset = 0ms`);
+      this.clockDriftOffset = 0;
     }
 
     // Test 2: API Connectivity (already tested by clock sync, just report it)
@@ -1012,7 +1049,14 @@ async function main() {
     console.log(`║  Trades executed:   ${String(stats.tradeCount).padEnd(38)}║`);
     console.log(`║  Total P&L:         $${stats.totalPnL.toFixed(2).padEnd(36)}║`);
     if (stats.latencyStats.sampleCount > 0) {
-      console.log(`║  Avg Latency:       ${String(stats.latencyStats.avgTotalMs + 'ms').padEnd(38)}║`);
+      const latencyLabel = Math.abs(stats.latencyStats.clockDriftOffset) > 1
+        ? `${stats.latencyStats.avgTotalMs}ms (calibrated)`
+        : `${stats.latencyStats.avgTotalMs}ms`;
+      console.log(`║  Avg Latency:       ${String(latencyLabel).padEnd(38)}║`);
+      if (Math.abs(stats.latencyStats.clockDriftOffset) > 1) {
+        const driftSign = stats.latencyStats.clockDriftOffset >= 0 ? '+' : '';
+        console.log(`║  Clock Drift:       ${String(driftSign + stats.latencyStats.clockDriftOffset.toFixed(1) + 'ms corrected').padEnd(38)}║`);
+      }
     }
     console.log("╚═══════════════════════════════════════════════════════════╝");
 

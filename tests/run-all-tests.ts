@@ -15,6 +15,7 @@ const tests = [
   { name: 'Copy Size Calculator', file: 'copy-size.test.ts' },
   { name: 'Paper Trading Executor', file: 'paper-executor.test.ts' },
   { name: 'TP/SL Monitor', file: 'tp-sl-monitor.test.ts' },
+  { name: 'Activity Poller', file: 'activity-poller.test.ts' },
 ];
 
 console.log('╔═══════════════════════════════════════════════════╗');

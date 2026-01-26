@@ -14,7 +14,8 @@
     "test:copysize": "ts-node tests/copy-size.test.ts",
     "demo:poller": "ts-node scripts/demo-poller.ts",
     "demo:strategy": "ts-node scripts/demo-strategy.ts",
-    "debug:api": "ts-node scripts/debug-api.ts"
+    "debug:api": "ts-node scripts/debug-api.ts",
+    "test:compare-pollers": "ts-node scripts/compare-positions-latency.ts"
   },
   "keywords": [
     "polymarket",

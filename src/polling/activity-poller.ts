@@ -92,9 +92,9 @@ export class ActivityPoller extends EventEmitter<ActivityPollerEvents> {
   private config: PollerConfig;
 
   // State
-  private intervalId: NodeJS.Timeout | null = null;
   private isRunning = false;
   private isPaused = false;
+  private shouldStop = false;
   private consecutiveErrors = 0;
   private pollCount = 0;
   private tradesDetected = 0;
@@ -121,6 +121,10 @@ export class ActivityPoller extends EventEmitter<ActivityPollerEvents> {
 
   /**
    * Start the polling loop
+   * Uses a tight loop instead of setInterval to eliminate wasted time.
+   * setInterval doesn't account for poll duration — if a poll takes 80ms
+   * and interval is 200ms, setInterval still waits 200ms after the poll starts,
+   * not after it ends. The tight loop waits only the remaining time.
    */
   async start(): Promise<void> {
     if (this.isRunning) {
@@ -137,21 +141,40 @@ export class ActivityPoller extends EventEmitter<ActivityPollerEvents> {
     console.log('='.repeat(50) + '\n');
 
     this.isRunning = true;
+    this.shouldStop = false;
     this.emit('start');
 
     // Do first poll immediately (initialize baseline)
     await this.poll(true);
 
-    // Then poll on interval
-    this.intervalId = setInterval(() => {
-      if (!this.isPaused) {
-        this.poll(false).catch(err => {
-          console.error('[ActivityPoller] Unhandled error:', err);
-        });
-      }
-    }, this.config.intervalMs);
-
     console.log('[ActivityPoller] ✅ Polling started\n');
+
+    // Tight poll loop: sleep only the remaining time after each poll completes
+    this.runPollLoop();
+  }
+
+  /**
+   * Tight poll loop — accounts for poll duration so we never waste time
+   */
+  private async runPollLoop(): Promise<void> {
+    while (!this.shouldStop) {
+      const pollStart = Date.now();
+
+      if (!this.isPaused) {
+        try {
+          await this.poll(false);
+        } catch (err) {
+          console.error('[ActivityPoller] Unhandled error:', err);
+        }
+      }
+
+      // Sleep only the remaining interval (subtract time the poll took)
+      const elapsed = Date.now() - pollStart;
+      const sleepTime = Math.max(0, this.config.intervalMs - elapsed);
+      if (sleepTime > 0) {
+        await new Promise(resolve => setTimeout(resolve, sleepTime));
+      }
+    }
   }
 
   /**
@@ -163,11 +186,7 @@ export class ActivityPoller extends EventEmitter<ActivityPollerEvents> {
       return;
     }
 
-    if (this.intervalId) {
-      clearInterval(this.intervalId);
-      this.intervalId = null;
-    }
-
+    this.shouldStop = true;
     this.isRunning = false;
     this.emit('stop');
 

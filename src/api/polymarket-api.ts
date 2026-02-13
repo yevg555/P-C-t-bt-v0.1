@@ -19,7 +19,20 @@
  *   - CLOB API: ~150 calls (15/sec)
  */
 
+import { Agent, fetch as undiciFetch } from "undici";
 import { Position, RawPositionResponse } from "../types";
+
+/**
+ * Undici HTTP agent with persistent keep-alive connections.
+ * Eliminates TCP + TLS handshake overhead on repeated API calls (~20-50ms savings per request).
+ * Native Node 22 fetch uses undici internally but doesn't expose connection pool tuning.
+ */
+const keepAliveDispatcher = new Agent({
+  keepAliveTimeout: 30_000,      // Keep idle connections alive for 30s
+  keepAliveMaxTimeout: 60_000,   // Max keep-alive duration
+  connections: 10,               // Max concurrent connections per origin
+  pipelining: 1,                 // HTTP pipelining (1 = disabled, safe default)
+});
 
 // Response types
 interface PriceResponse {
@@ -129,6 +142,20 @@ export class PolymarketAPI {
   private dataApiUrl = "https://data-api.polymarket.com";
   private clobApiUrl = "https://clob.polymarket.com";
 
+  /**
+   * Wrapper around fetch that uses the keep-alive agent for persistent connections.
+   * Saves ~20-50ms per request by reusing TCP connections.
+   */
+  private async fetch(url: string, init?: RequestInit): Promise<Response> {
+    const response = await undiciFetch(url, {
+      method: init?.method,
+      headers: init?.headers as Record<string, string> | undefined,
+      body: init?.body as string | undefined,
+      dispatcher: keepAliveDispatcher,
+    });
+    return response as unknown as Response;
+  }
+
   // Differentiated rate limiting per endpoint type
   // /activity: 1000 calls/10s = 100/sec = 10ms between requests
   // /positions: 200 calls/10s = 20/sec = 50ms between requests
@@ -166,7 +193,7 @@ export class PolymarketAPI {
     const url = `${this.dataApiUrl}/positions?user=${address}`;
 
     try {
-      const response = await fetch(url, {
+      const response = await this.fetch(url, {
         method: "GET",
         headers: { Accept: "application/json" },
       });
@@ -224,7 +251,7 @@ export class PolymarketAPI {
     const url = `${this.dataApiUrl}/value?user=${address}`;
 
     try {
-      const response = await fetch(url, {
+      const response = await this.fetch(url, {
         method: "GET",
         headers: { Accept: "application/json" },
       });
@@ -356,7 +383,7 @@ export class PolymarketAPI {
     }
 
     try {
-      const response = await fetch(url, {
+      const response = await this.fetch(url, {
         method: "GET",
         headers: { Accept: "application/json" },
       });
@@ -481,7 +508,7 @@ export class PolymarketAPI {
     const url = `${this.clobApiUrl}/price?token_id=${tokenId}&side=${apiSide}`;
 
     try {
-      const response = await fetch(url, {
+      const response = await this.fetch(url, {
         method: "GET",
         headers: { Accept: "application/json" },
       });
@@ -602,7 +629,7 @@ export class PolymarketAPI {
 
     const url = `${this.clobApiUrl}/price?token_id=${tokenId}&side=${side}`;
 
-    const response = await fetch(url, {
+    const response = await this.fetch(url, {
       method: "GET",
       headers: { Accept: "application/json" },
     });
@@ -624,7 +651,7 @@ export class PolymarketAPI {
 
     const url = `${this.clobApiUrl}/midpoint?token_id=${tokenId}`;
 
-    const response = await fetch(url, {
+    const response = await this.fetch(url, {
       method: "GET",
       headers: { Accept: "application/json" },
     });
@@ -645,7 +672,7 @@ export class PolymarketAPI {
 
     const url = `${this.clobApiUrl}/spread?token_id=${tokenId}`;
 
-    const response = await fetch(url, {
+    const response = await this.fetch(url, {
       method: "GET",
       headers: { Accept: "application/json" },
     });
@@ -669,7 +696,7 @@ export class PolymarketAPI {
 
     const url = `${this.clobApiUrl}/book?token_id=${tokenId}`;
 
-    const response = await fetch(url, {
+    const response = await this.fetch(url, {
       method: "GET",
       headers: { Accept: "application/json" },
     });
@@ -837,7 +864,7 @@ export class PolymarketAPI {
 
     try {
       // Fetch from Polymarket API to get server time
-      const response = await fetch(`${this.dataApiUrl}/activity?limit=1`, {
+      const response = await this.fetch(`${this.dataApiUrl}/activity?limit=1`, {
         method: "GET",
         headers: { Accept: "application/json" },
       });

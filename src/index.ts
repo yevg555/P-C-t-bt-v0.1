@@ -309,40 +309,47 @@ class CopyTradingBot {
       return;
     }
 
-    // Step 2: Determine price to use for our order
-    // We have the trader's exact execution price from the /activity endpoint
+    // Steps 2+3: Fetch price, balance, and portfolio value IN PARALLEL
+    // These are independent operations — running them concurrently saves ~50-100ms
     let currentPrice = trade.price;
     console.log(`[PRICE] Trader's execution price: $${currentPrice.toFixed(4)}`);
 
-    if (this.useTraderPrice) {
-      // Use trader's price directly - saves ~67ms by skipping CLOB API call
-      console.log(`[PRICE] Using trader's price (USE_TRADER_PRICE=true)`);
-    } else {
-      // Fetch current market price for potentially better execution
-      try {
-        const marketPrice = await this.api.getPrice(trade.tokenId, trade.side);
-        const priceDiff = ((marketPrice - trade.price) / trade.price * 100).toFixed(2);
-        console.log(`[PRICE] Current market price: $${marketPrice.toFixed(4)} (${priceDiff}% from trade)`);
-        currentPrice = marketPrice;
-      } catch {
+    const [priceResult, balance, traderPortfolioValueResult] = await Promise.all([
+      // Price fetch (skip if using trader price)
+      this.useTraderPrice
+        ? Promise.resolve({ price: trade.price, usedTraderPrice: true })
+        : this.api.getPrice(trade.tokenId, trade.side)
+            .then(price => ({ price, usedTraderPrice: false }))
+            .catch(() => ({ price: trade.price, usedTraderPrice: true, failed: true })),
+      // Balance fetch
+      this.executor.getBalance(),
+      // Portfolio value fetch (try cache first, then API)
+      (async (): Promise<number | undefined> => {
+        const cached = this.api.getCachedPortfolioValue(this.traderConfig.address);
+        if (cached !== undefined) return cached;
+        try {
+          return await this.api.getPortfolioValue(this.traderConfig.address);
+        } catch (error) {
+          console.warn(`[SIZE] Could not get trader portfolio value: ${error}`);
+          return undefined;
+        }
+      })(),
+    ]);
+
+    // Apply price result
+    if (priceResult.usedTraderPrice) {
+      if ((priceResult as { failed?: boolean }).failed) {
         console.log(`[PRICE] Using trader's price (market fetch failed)`);
+      } else {
+        console.log(`[PRICE] Using trader's price (USE_TRADER_PRICE=true)`);
       }
+    } else {
+      const priceDiff = ((priceResult.price - trade.price) / trade.price * 100).toFixed(2);
+      console.log(`[PRICE] Current market price: $${priceResult.price.toFixed(4)} (${priceDiff}% from trade)`);
     }
+    currentPrice = priceResult.price;
 
-    // Step 3: Calculate copy size
-    const balance = await this.executor.getBalance();
-
-    // Get trader portfolio value for proportional_to_trader sizing
-    let traderPortfolioValue: number | undefined =
-      this.api.getCachedPortfolioValue(this.traderConfig.address);
-
-    if (traderPortfolioValue === undefined) {
-      try {
-        traderPortfolioValue = await this.api.getPortfolioValue(this.traderConfig.address);
-      } catch (error) {
-        console.warn(`[SIZE] Could not get trader portfolio value: ${error}`);
-      }
-    }
+    const traderPortfolioValue = traderPortfolioValueResult;
 
     const sizeResult = this.sizeCalculator.calculate({
       change,
@@ -389,8 +396,8 @@ class CopyTradingBot {
 
     console.log(`[ORDER] Type: ${order.orderType?.toUpperCase()}, Expires: ${order.expiresInMs ? `${orderConfig.expirationSeconds}s` : 'GTC'}`);
 
-    // Step 6: Risk check
-    const tradingState = await this.getTradingState();
+    // Step 6: Risk check (pass cached balance to avoid redundant fetch)
+    const tradingState = await this.getTradingState(balance);
     const riskResult = this.riskChecker.check(order, tradingState);
 
     if (!riskResult.approved) {
@@ -668,9 +675,10 @@ class CopyTradingBot {
 
   /**
    * Get current trading state for risk checks
+   * @param cachedBalance - Optional pre-fetched balance to avoid redundant API call
    */
-  private async getTradingState(): Promise<TradingState> {
-    const balance = await this.executor.getBalance();
+  private async getTradingState(cachedBalance?: number): Promise<TradingState> {
+    const balance = cachedBalance ?? await this.executor.getBalance();
     const positions = await this.executor.getAllPositions();
 
     let totalShares = 0;

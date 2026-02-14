@@ -22,6 +22,7 @@ import { PolymarketAPI, Trade } from "./api/polymarket-api";
 import { CopySizeCalculator } from "./strategy/copy-size";
 import { RiskChecker, TradingState } from "./strategy/risk-checker";
 import { PriceAdjuster } from "./strategy/price-adjuster";
+import { MarketAnalyzer, DEFAULT_MARKET_ANALYSIS_CONFIG } from "./strategy/market-analyzer";
 import { TpSlMonitor, TpSlTriggerEvent } from "./strategy/tp-sl-monitor";
 import {
   createExecutor,
@@ -37,6 +38,7 @@ import {
   BelowMinLimitAction,
   AutoTpSlConfig,
   TraderConfig,
+  MarketAnalysisConfig,
 } from "./types";
 
 /**
@@ -67,6 +69,8 @@ class CopyTradingBot {
   private sizeCalculator: CopySizeCalculator;
   private riskChecker: RiskChecker;
   private priceAdjuster: PriceAdjuster;
+  private marketAnalyzer: MarketAnalyzer;
+  private marketAnalysisConfig: MarketAnalysisConfig;
   private executor: OrderExecutor;
   private tpSlMonitor: TpSlMonitor;
 
@@ -183,8 +187,24 @@ class CopyTradingBot {
     });
 
     this.priceAdjuster = new PriceAdjuster(
-      parseInt(process.env.PRICE_OFFSET_BPS || "50")
+      parseInt(process.env.PRICE_OFFSET_BPS || "50"),
+      {
+        adaptiveThresholdBps: parseInt(process.env.ADAPTIVE_SPREAD_THRESHOLD_BPS || "150"),
+        spreadMultiplier: parseFloat(process.env.ADAPTIVE_SPREAD_MULTIPLIER || "0.5"),
+        maxAdaptiveOffsetBps: parseInt(process.env.MAX_ADAPTIVE_OFFSET_BPS || "300"),
+      }
     );
+
+    // Market analysis configuration
+    this.marketAnalysisConfig = {
+      wideSpreadThresholdBps: parseInt(process.env.WIDE_SPREAD_THRESHOLD_BPS || "200"),
+      maxSpreadBps: parseInt(process.env.MAX_SPREAD_BPS || "800"),
+      maxDivergenceBps: parseInt(process.env.MAX_DIVERGENCE_BPS || "500"),
+      minDepthShares: parseInt(process.env.MIN_DEPTH_SHARES || "10"),
+      depthRangePercent: parseFloat(process.env.DEPTH_RANGE_PERCENT || "0.01"),
+      stalePriceThresholdMs: parseInt(process.env.STALE_PRICE_THRESHOLD_MS || "10000"),
+    };
+    this.marketAnalyzer = new MarketAnalyzer(this.marketAnalysisConfig);
 
     // Create executor based on TRADING_MODE
     this.executor = createExecutor({
@@ -321,18 +341,20 @@ class CopyTradingBot {
       return;
     }
 
-    // Steps 2+3: Fetch price, balance, and portfolio value IN PARALLEL
-    // These are independent operations — running them concurrently saves ~50-100ms
-    let currentPrice = trade.price;
-    console.log(`[PRICE] Trader's execution price: $${currentPrice.toFixed(4)}`);
+    // ================================================
+    // STEP 2: FETCH DATA IN PARALLEL
+    // Order book + balance + portfolio value — all independent
+    // ================================================
+    console.log(`[PRICE] Trader's execution price: $${trade.price.toFixed(4)}`);
 
-    const [priceResult, balance, traderPortfolioValueResult] = await Promise.all([
-      // Price fetch (skip if using trader price)
-      this.useTraderPrice
-        ? Promise.resolve({ price: trade.price, usedTraderPrice: true })
-        : this.api.getPrice(trade.tokenId, trade.side)
-            .then(price => ({ price, usedTraderPrice: false }))
-            .catch(() => ({ price: trade.price, usedTraderPrice: true, failed: true })),
+    const [orderBookResult, balance, traderPortfolioValueResult] = await Promise.all([
+      // Fetch full order book (primary) — gives us spread, depth, everything
+      this.api.getOrderBook(trade.tokenId)
+        .then(book => ({ book, success: true as const }))
+        .catch((err) => {
+          console.warn(`[MARKET] Order book fetch failed: ${err}`);
+          return { book: { bids: [], asks: [] }, success: false as const };
+        }),
       // Balance fetch
       this.executor.getBalance(),
       // Portfolio value fetch (try cache first, then API)
@@ -348,21 +370,88 @@ class CopyTradingBot {
       })(),
     ]);
 
-    // Apply price result
-    if (priceResult.usedTraderPrice) {
-      if ((priceResult as { failed?: boolean }).failed) {
-        console.log(`[PRICE] Using trader's price (market fetch failed)`);
+    // ================================================
+    // STEP 3: ANALYZE MARKET CONDITIONS
+    // Build a MarketSnapshot from the order book
+    // ================================================
+    let snapshot = this.marketAnalyzer.analyze(
+      trade.tokenId,
+      orderBookResult.book,
+      trade.price
+    );
+
+    // If order book was empty but we have a trader price, build price-only snapshot
+    if (!orderBookResult.success || (orderBookResult.book.bids.length === 0 && orderBookResult.book.asks.length === 0)) {
+      if (this.useTraderPrice) {
+        // Use trader price as both bid and ask (no spread info available)
+        snapshot = this.marketAnalyzer.analyzeFromPrices(
+          trade.tokenId,
+          trade.price,
+          trade.price,
+          trade.price
+        );
+        console.log(`[MARKET] Using trader price (book unavailable): $${trade.price.toFixed(4)}`);
       } else {
-        console.log(`[PRICE] Using trader's price (USE_TRADER_PRICE=true)`);
+        // Try to get at least bid/ask prices as fallback
+        try {
+          const [askPrice, bidPrice] = await Promise.all([
+            this.api.getPrice(trade.tokenId, "BUY"),
+            this.api.getPrice(trade.tokenId, "SELL"),
+          ]);
+          snapshot = this.marketAnalyzer.analyzeFromPrices(
+            trade.tokenId,
+            askPrice,
+            bidPrice,
+            trade.price
+          );
+          console.log(`[MARKET] Fallback to price endpoints: bid=$${bidPrice.toFixed(4)} ask=$${askPrice.toFixed(4)}`);
+        } catch {
+          console.log(`[MARKET] All price sources failed, using trader price`);
+        }
       }
-    } else {
-      const priceDiff = ((priceResult.price - trade.price) / trade.price * 100).toFixed(2);
-      console.log(`[PRICE] Current market price: $${priceResult.price.toFixed(4)} (${priceDiff}% from trade)`);
     }
-    currentPrice = priceResult.price;
+
+    // Log market snapshot
+    console.log(
+      `[MARKET] Bid: $${snapshot.bestBid.toFixed(4)} | Ask: $${snapshot.bestAsk.toFixed(4)} | ` +
+      `Spread: ${snapshot.spreadBps.toFixed(0)}bps | Divergence: ${snapshot.divergenceBps.toFixed(0)}bps | ` +
+      `Condition: ${snapshot.condition.toUpperCase()}`
+    );
+    if (snapshot.askDepthNear > 0 || snapshot.bidDepthNear > 0) {
+      console.log(
+        `[MARKET] Depth near best: ask=${snapshot.askDepthNear.toFixed(0)} shares, bid=${snapshot.bidDepthNear.toFixed(0)} shares`
+      );
+    }
+
+    // ================================================
+    // STEP 4: MARKET CONDITION RISK CHECK (pre-filter)
+    // Reject early if conditions are extreme
+    // ================================================
+    const marketRisk = this.riskChecker.checkMarketConditions(
+      snapshot,
+      this.marketAnalysisConfig
+    );
+
+    if (!marketRisk.approved) {
+      console.log(`[RISK] MARKET REJECTED: ${marketRisk.reason}`);
+      return;
+    }
+    if (marketRisk.warnings.length > 0) {
+      marketRisk.warnings.forEach((w) => console.log(`  [MARKET] ${w}`));
+    }
+
+    // ================================================
+    // STEP 5: DETERMINE PRICE
+    // Use order-book-derived price (not a single /price endpoint)
+    // ================================================
+    const currentPrice = this.marketAnalyzer.getRecommendedPrice(snapshot, trade.side);
+    console.log(`[PRICE] Recommended price for ${trade.side}: $${currentPrice.toFixed(4)}`);
 
     const traderPortfolioValue = traderPortfolioValueResult;
 
+    // ================================================
+    // STEP 6: CALCULATE SIZE
+    // ================================================
     const sizeResult = this.sizeCalculator.calculate({
       change,
       currentPrice,
@@ -381,34 +470,69 @@ class CopyTradingBot {
       return;
     }
 
-    // Step 4: Adjust price for better fill
-    const adjustedPrice = this.priceAdjuster.adjust(currentPrice, trade.side);
-    const priceDetails = this.priceAdjuster.getAdjustmentDetails(
+    // ================================================
+    // STEP 6b: DEPTH-AWARE SIZE ADJUSTMENT
+    // Reduce size if the book can't absorb our order near best price
+    // ================================================
+    let finalSize = sizeResult.shares;
+    const depthAdj = this.sizeCalculator.adjustForDepth(finalSize, snapshot, trade.side);
+    if (depthAdj.adjustment) {
+      console.log(`[SIZE] ${depthAdj.adjustment}`);
+      finalSize = depthAdj.shares;
+    }
+
+    if (finalSize === 0) {
+      console.log("[SKIP] Size reduced to 0 by depth adjustment");
+      return;
+    }
+
+    // ================================================
+    // STEP 7: SPREAD-ADAPTIVE PRICE OFFSET
+    // Wider spread → bigger offset to ensure fill
+    // ================================================
+    const priceAdj = this.priceAdjuster.getAdaptiveAdjustmentDetails(
       currentPrice,
       trade.side,
-      sizeResult.shares
+      finalSize,
+      snapshot
     );
-    console.log(`[PRICE] ${priceDetails.description}`);
+    const adjustedPrice = priceAdj.adjustedPrice;
+    console.log(`[PRICE] ${priceAdj.description}`);
 
-    // Step 5: Create order spec
+    // ================================================
+    // STEP 8: ADAPTIVE EXPIRATION
+    // Volatile market → shorter expiration
+    // ================================================
     const orderConfig = this.sizeCalculator.getOrderConfig();
-    const expiresInMs = orderConfig.expirationSeconds * 1000;
+    const adaptiveExp = this.sizeCalculator.getAdaptiveExpiration(
+      snapshot,
+      orderConfig.expirationSeconds
+    );
+    if (adaptiveExp.reason) {
+      console.log(`[ORDER] ${adaptiveExp.reason}`);
+    }
+    const expiresInMs = adaptiveExp.expirationSeconds * 1000;
 
+    // ================================================
+    // STEP 9: BUILD ORDER
+    // ================================================
     const order: OrderSpec = {
       tokenId: trade.tokenId,
       side: trade.side,
-      size: sizeResult.shares,
+      size: finalSize,
       price: adjustedPrice,
       orderType: orderConfig.orderType,
       expiresInMs: expiresInMs > 0 ? expiresInMs : undefined,
       expiresAt: expiresInMs > 0 ? new Date(Date.now() + expiresInMs) : undefined,
-      priceOffsetBps: orderConfig.priceOffsetBps,
+      priceOffsetBps: priceAdj.effectiveOffsetBps,
       triggeredBy: change,
     };
 
-    console.log(`[ORDER] Type: ${order.orderType?.toUpperCase()}, Expires: ${order.expiresInMs ? `${orderConfig.expirationSeconds}s` : 'GTC'}`);
+    console.log(`[ORDER] Type: ${order.orderType?.toUpperCase()}, Expires: ${order.expiresInMs ? `${adaptiveExp.expirationSeconds}s` : 'GTC'}, Size: ${finalSize.toFixed(2)} @ $${adjustedPrice.toFixed(4)}`);
 
-    // Step 6: Risk check (pass cached balance to avoid redundant fetch)
+    // ================================================
+    // STEP 10: STANDARD RISK CHECK (balance, limits, P&L)
+    // ================================================
     const tradingState = await this.getTradingState(balance);
     const riskResult = this.riskChecker.check(order, tradingState);
 
@@ -422,7 +546,13 @@ class CopyTradingBot {
       riskResult.warnings.forEach((w) => console.log(`  - ${w}`));
     }
 
-    console.log(`[RISK] Approved (level: ${riskResult.riskLevel})`);
+    // Combine risk levels from market + standard checks
+    const combinedRiskLevel = marketRisk.riskLevel === "high" || riskResult.riskLevel === "high"
+      ? "high"
+      : marketRisk.riskLevel === "medium" || riskResult.riskLevel === "medium"
+      ? "medium"
+      : "low";
+    console.log(`[RISK] Approved (market: ${marketRisk.riskLevel}, portfolio: ${riskResult.riskLevel}, combined: ${combinedRiskLevel})`);
 
     // Step 7: Execute the order
     console.log(`[EXEC] Executing ${order.side} ${order.size} @ $${order.price.toFixed(4)}...`);

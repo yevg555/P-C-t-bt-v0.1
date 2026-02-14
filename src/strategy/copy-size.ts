@@ -26,7 +26,7 @@
  *   → You sell 50 shares (50% of your position)
  */
 
-import { PositionChange, CopyConfig, SellStrategy, BelowMinLimitAction } from '../types';
+import { PositionChange, CopyConfig, SellStrategy, BelowMinLimitAction, MarketSnapshot } from '../types';
 
 /**
  * Input needed to calculate copy size
@@ -383,6 +383,67 @@ export class CopySizeCalculator {
     }
 
     return { copy: true, reason: 'OK - BUY signal' };
+  }
+
+  /**
+   * Adjust calculated size based on order book depth.
+   *
+   * If the book near the best price can't support our full order,
+   * we scale down proportionally to avoid walking the book and
+   * getting filled at much worse prices.
+   *
+   * @param calculatedShares - Shares from the standard calculate() method
+   * @param snapshot - Market snapshot with depth data
+   * @param side - BUY or SELL
+   * @returns Adjusted shares and adjustment reason (if any)
+   */
+  adjustForDepth(
+    calculatedShares: number,
+    snapshot: MarketSnapshot,
+    side: "BUY" | "SELL"
+  ): { shares: number; adjustment?: string } {
+    if (calculatedShares <= 0) return { shares: 0 };
+
+    const nearDepth = side === "BUY" ? snapshot.askDepthNear : snapshot.bidDepthNear;
+
+    // If we have no depth data (e.g., price-only snapshot), skip adjustment
+    if (nearDepth <= 0) return { shares: calculatedShares };
+
+    // If our order fits within available depth, no adjustment needed
+    if (calculatedShares <= nearDepth) return { shares: calculatedShares };
+
+    // Scale down to available depth (never more than what the book can absorb near best price)
+    // Use 80% of depth as a safety margin to avoid sweeping the entire level
+    const safeSize = Math.floor(nearDepth * 0.8 * 100) / 100;
+    const reduced = Math.max(safeSize, this.config.minOrderSize);
+    const finalShares = Math.min(reduced, calculatedShares);
+
+    return {
+      shares: finalShares,
+      adjustment: `Reduced from ${calculatedShares.toFixed(2)} to ${finalShares.toFixed(2)} shares (book depth: ${nearDepth.toFixed(0)} near best price)`,
+    };
+  }
+
+  /**
+   * Calculate the adaptive expiration based on market conditions.
+   *
+   * Wide spread / volatile = shorter expiration (don't leave orders hanging)
+   * Normal conditions = use configured expiration
+   */
+  getAdaptiveExpiration(
+    snapshot: MarketSnapshot,
+    baseExpirationSeconds: number
+  ): { expirationSeconds: number; reason?: string } {
+    if (!snapshot.isVolatile) {
+      return { expirationSeconds: baseExpirationSeconds };
+    }
+
+    // In volatile conditions, use half the normal expiration (min 5 seconds)
+    const reduced = Math.max(5, Math.floor(baseExpirationSeconds / 2));
+    return {
+      expirationSeconds: reduced,
+      reason: `Volatile market (${snapshot.condition}) → expiration reduced from ${baseExpirationSeconds}s to ${reduced}s`,
+    };
   }
 
   /**

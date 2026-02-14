@@ -292,6 +292,95 @@ export interface OrderExecutor {
 }
 
 // ============================================
+// MARKET ANALYSIS TYPES
+// ============================================
+
+/**
+ * A snapshot of market conditions at a point in time.
+ * Built from the order book — gives us everything we need
+ * to make an informed copy-trading decision.
+ */
+export interface MarketSnapshot {
+  tokenId: string;
+  timestamp: Date;
+
+  /** Best ask price (what we'd pay to BUY) */
+  bestAsk: number;
+  /** Best bid price (what we'd get to SELL) */
+  bestBid: number;
+  /** Midpoint price */
+  midpoint: number;
+
+  /** Absolute spread (ask - bid) */
+  spread: number;
+  /** Spread as percentage of midpoint */
+  spreadBps: number;
+
+  /** Total shares available within 1% of best ask */
+  askDepthNear: number;
+  /** Total shares available within 1% of best bid */
+  bidDepthNear: number;
+
+  /** Weighted average price to fill `targetSize` shares (BUY side) */
+  weightedAskForSize?: number;
+  /** Weighted average price to fill `targetSize` shares (SELL side) */
+  weightedBidForSize?: number;
+
+  /** How much the price has moved since the trader's fill */
+  divergenceFromTrader: number;
+  /** Divergence as basis points */
+  divergenceBps: number;
+
+  /** Is the book too thin / spread too wide? */
+  isVolatile: boolean;
+  /** Human-readable market condition */
+  condition: "normal" | "wide_spread" | "thin_book" | "high_divergence" | "stale";
+  /** Reasons for the condition assessment */
+  conditionReasons: string[];
+}
+
+/**
+ * Configuration for market analysis thresholds
+ */
+export interface MarketAnalysisConfig {
+  /** Spread above this (bps) is considered "wide" — triggers adaptive offset */
+  wideSpreadThresholdBps: number;
+  /** Spread above this (bps) rejects the trade entirely */
+  maxSpreadBps: number;
+  /** Divergence above this (bps) from trader's price rejects the trade */
+  maxDivergenceBps: number;
+  /** Minimum depth (shares) required near best price to proceed */
+  minDepthShares: number;
+  /** How far from best price to measure depth (as multiplier, e.g. 0.01 = 1%) */
+  depthRangePercent: number;
+  /** Price data older than this (ms) is considered stale */
+  stalePriceThresholdMs: number;
+}
+
+/**
+ * The final trade decision with full reasoning
+ */
+export interface TradeDecision {
+  /** Should we execute this trade? */
+  execute: boolean;
+  /** Why we made this decision */
+  reason: string;
+  /** Detailed adjustments applied */
+  adjustments: string[];
+
+  /** Final order parameters (if execute=true) */
+  finalPrice?: number;
+  finalSize?: number;
+  finalOffsetBps?: number;
+  expirationMs?: number;
+
+  /** Market snapshot used for the decision */
+  marketSnapshot?: MarketSnapshot;
+  /** Risk level based on market conditions */
+  marketRisk: "low" | "medium" | "high" | "extreme";
+}
+
+// ============================================
 // API RESPONSE TYPES
 // ============================================
 

@@ -104,6 +104,9 @@ export class ActivityPoller extends EventEmitter<ActivityPollerEvents> {
   private lastTradeTimestamp: number | null = null;
   private seenTradeIds: Set<string> = new Set();
 
+  // Immediate poll trigger (used by WebSocket hybrid)
+  private pollTriggerResolve: (() => void) | null = null;
+
   // Latency tracking
   private latencySamples: number[] = [];
   private maxLatencySamples = 100;
@@ -154,7 +157,9 @@ export class ActivityPoller extends EventEmitter<ActivityPollerEvents> {
   }
 
   /**
-   * Tight poll loop — accounts for poll duration so we never waste time
+   * Tight poll loop — accounts for poll duration so we never waste time.
+   * Also supports immediate triggering via triggerPollNow() — if a WebSocket
+   * detects a trade, it can skip the remaining sleep and poll immediately.
    */
   private async runPollLoop(): Promise<void> {
     while (!this.shouldStop) {
@@ -169,11 +174,27 @@ export class ActivityPoller extends EventEmitter<ActivityPollerEvents> {
       }
 
       // Sleep only the remaining interval (subtract time the poll took)
+      // BUT: if triggerPollNow() is called, wake up immediately
       const elapsed = Date.now() - pollStart;
       const sleepTime = Math.max(0, this.config.intervalMs - elapsed);
       if (sleepTime > 0) {
-        await new Promise(resolve => setTimeout(resolve, sleepTime));
+        await Promise.race([
+          new Promise(resolve => setTimeout(resolve, sleepTime)),
+          new Promise<void>(resolve => { this.pollTriggerResolve = resolve; }),
+        ]);
+        this.pollTriggerResolve = null;
       }
+    }
+  }
+
+  /**
+   * Trigger an immediate poll, skipping the remaining sleep interval.
+   * Used by the WebSocket hybrid to react to trade signals instantly.
+   */
+  triggerPollNow(): void {
+    if (this.pollTriggerResolve) {
+      this.pollTriggerResolve();
+      this.pollTriggerResolve = null;
     }
   }
 

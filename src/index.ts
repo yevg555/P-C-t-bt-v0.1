@@ -17,6 +17,7 @@ import * as dotenv from "dotenv";
 import * as readline from "readline";
 import { PositionPoller } from "./polling";
 import { ActivityPoller, TradeEvent } from "./polling/activity-poller";
+import { MarketWebSocket } from "./polling/market-websocket";
 import { PolymarketAPI, Trade } from "./api/polymarket-api";
 import { CopySizeCalculator } from "./strategy/copy-size";
 import { RiskChecker, TradingState } from "./strategy/risk-checker";
@@ -81,6 +82,12 @@ class CopyTradingBot {
 
   // Portfolio value prefetch interval
   private portfolioValuePrefetchInterval: NodeJS.Timeout | null = null;
+
+  // Watched token IDs for price cache warming (from trader's positions)
+  private watchedTokenIds: Set<string> = new Set();
+
+  // Hybrid WebSocket trigger (Tier 3H)
+  private marketWebSocket: MarketWebSocket | null = null;
 
   // Tracking state
   private dailyPnL: number = 0;
@@ -271,6 +278,11 @@ class CopyTradingBot {
     console.log(`Token: ${trade.tokenId.slice(0, 20)}...`);
     if (trade.marketTitle) {
       console.log(`Market: ${trade.marketTitle}`);
+    }
+
+    // Keep price cache warmer up to date with new tokens
+    if (trade.side === "BUY") {
+      this.addWatchedToken(trade.tokenId);
     }
     console.log(`Trade Time: ${trade.timestamp.toISOString()}`);
 
@@ -779,6 +791,10 @@ class CopyTradingBot {
     // This ensures low latency for proportional_to_trader sizing
     await this.startPortfolioValuePrefetch();
 
+    // Start price cache warmer for trader's current positions
+    // Keeps CLOB prices hot so trade execution doesn't need to wait for price fetch
+    await this.startPriceCacheWarmer();
+
     // Start TP/SL monitoring if enabled
     if (tpSlConfig.enabled && this.executor instanceof PaperTradingExecutor) {
       this.startTpSlMonitoring();
@@ -867,6 +883,80 @@ class CopyTradingBot {
         // Silently ignore prefetch errors
       }
     }, prefetchIntervalMs);
+  }
+
+  /**
+   * Start price cache warmer for the trader's currently held positions.
+   * Fetches the trader's positions and keeps CLOB prices warm for those tokens.
+   * When a new trade is detected, the token is added to the watched set.
+   */
+  private async startPriceCacheWarmer(): Promise<void> {
+    try {
+      const positions = await this.api.getPositions(this.traderConfig.address);
+      const tokenIds = positions.map(p => p.tokenId);
+      this.watchedTokenIds = new Set(tokenIds);
+
+      if (tokenIds.length > 0) {
+        // Refresh every 4s (just under the 5s price cache TTL)
+        this.api.startPriceCacheWarmer(tokenIds, 4000);
+        console.log(`[PREFETCH] Price cache warmer: ${tokenIds.length} tokens from trader's positions`);
+
+        // Start hybrid WebSocket trigger (Tier 3H)
+        // WebSocket listens for real-time trade events on the trader's markets
+        // and triggers an immediate poll instead of waiting for the next interval
+        this.startMarketWebSocket(tokenIds);
+      }
+    } catch (error) {
+      console.warn(`[PREFETCH] Could not start price cache warmer: ${error}`);
+    }
+  }
+
+  /**
+   * Start the WebSocket trigger that fires immediate polls on trade signals
+   */
+  private startMarketWebSocket(tokenIds: string[]): void {
+    if (!this.activityPoller) {
+      return; // Only useful with activity polling
+    }
+
+    this.marketWebSocket = new MarketWebSocket();
+
+    const poller = this.activityPoller;
+
+    this.marketWebSocket.on('trade_signal', (tokenId: string) => {
+      // A trade happened on one of the trader's markets — poll immediately!
+      poller.triggerPollNow();
+    });
+
+    this.marketWebSocket.on('connected', () => {
+      console.log('[BOT] WebSocket trigger connected — hybrid mode active');
+    });
+
+    this.marketWebSocket.on('disconnected', (reason: string) => {
+      console.log(`[BOT] WebSocket trigger disconnected: ${reason} — falling back to polling-only`);
+    });
+
+    this.marketWebSocket.on('error', (error: Error) => {
+      // Non-fatal: polling continues as fallback
+      console.warn(`[BOT] WebSocket trigger error: ${error.message}`);
+    });
+
+    this.marketWebSocket.start(tokenIds);
+  }
+
+  /**
+   * Add a token to the watched set (called when trader opens a new position)
+   */
+  private addWatchedToken(tokenId: string): void {
+    if (!this.watchedTokenIds.has(tokenId)) {
+      this.watchedTokenIds.add(tokenId);
+      this.api.updateWatchedTokens(Array.from(this.watchedTokenIds));
+
+      // Also update WebSocket subscriptions
+      if (this.marketWebSocket) {
+        this.marketWebSocket.updateTokens(Array.from(this.watchedTokenIds));
+      }
+    }
   }
 
   /**
@@ -975,6 +1065,15 @@ class CopyTradingBot {
     if (this.portfolioValuePrefetchInterval) {
       clearInterval(this.portfolioValuePrefetchInterval);
       this.portfolioValuePrefetchInterval = null;
+    }
+
+    // Stop price cache warmer
+    this.api.stopPriceCacheWarmer();
+
+    // Stop WebSocket trigger
+    if (this.marketWebSocket) {
+      this.marketWebSocket.stop();
+      this.marketWebSocket = null;
     }
 
     // Clean up keyboard listener

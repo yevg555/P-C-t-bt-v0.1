@@ -28,6 +28,7 @@ import {
   createExecutor,
   getTradingMode,
   PaperTradingExecutor,
+  LiveTradingExecutor,
 } from "./execution";
 import {
   PositionChange,
@@ -828,10 +829,13 @@ class CopyTradingBot {
       totalShares += qty;
     }
 
-    // Get P&L from paper executor if available
+    // Get P&L from executor if available
     if (this.executor instanceof PaperTradingExecutor) {
       this.totalPnL = this.executor.getTotalPnL();
       this.dailyPnL = this.totalPnL; // For now, daily = total (no daily reset)
+    } else if (this.executor instanceof LiveTradingExecutor) {
+      this.totalPnL = this.executor.getTotalPnL();
+      this.dailyPnL = this.totalPnL;
     }
 
     // Get spend tracker if available
@@ -905,6 +909,13 @@ class CopyTradingBot {
     console.log(`  1-Click Sell:     ${this.oneClickSellEnabled ? "ENABLED (press 'q')" : "DISABLED"}`);
     console.log("");
 
+    // Initialize live executor if needed (connects wallet, derives API creds)
+    if (this.executor instanceof LiveTradingExecutor) {
+      console.log("  --- Live Executor Initialization ---");
+      await this.executor.initialize();
+      console.log("");
+    }
+
     // Run startup tests
     console.log("  --- Startup Tests ---");
     await this.runStartupTests();
@@ -925,8 +936,8 @@ class CopyTradingBot {
     // Keeps CLOB prices hot so trade execution doesn't need to wait for price fetch
     await this.startPriceCacheWarmer();
 
-    // Start TP/SL monitoring if enabled
-    if (tpSlConfig.enabled && this.executor instanceof PaperTradingExecutor) {
+    // Start TP/SL monitoring if enabled (works with both paper and live)
+    if (tpSlConfig.enabled && this.executor.getAllPositionDetails) {
       this.startTpSlMonitoring();
     }
 
@@ -1093,14 +1104,14 @@ class CopyTradingBot {
    * Start TP/SL monitoring
    */
   private startTpSlMonitoring(): void {
-    if (!(this.executor instanceof PaperTradingExecutor)) {
+    if (!this.executor.getAllPositionDetails) {
       return;
     }
 
     const executor = this.executor;
 
     this.tpSlMonitor.startMonitoring(
-      async () => executor.getAllPositionDetails(),
+      async () => executor.getAllPositionDetails!(),
       async (tokenIds: string[]) => {
         const prices = new Map<string, number>();
         for (const tokenId of tokenIds) {
@@ -1148,13 +1159,15 @@ class CopyTradingBot {
    * Execute 1-Click Sell - sell all positions immediately
    */
   private async executeOneClickSell(): Promise<void> {
-    if (!(this.executor instanceof PaperTradingExecutor)) {
-      console.log("[1-Click Sell] Only available in paper trading mode");
+    if (!this.executor.sellAllPositions || !this.executor.getAllPositionDetails) {
+      console.log("[1-Click Sell] Not supported by current executor");
       return;
     }
 
-    const executor = this.executor;
-    const positions = await executor.getAllPositionDetails();
+    const getAllPositionDetails = this.executor.getAllPositionDetails!.bind(this.executor);
+    const sellAllPositions = this.executor.sellAllPositions!.bind(this.executor);
+
+    const positions = await getAllPositionDetails();
 
     if (positions.size === 0) {
       console.log("\n[1-Click Sell] No positions to sell\n");
@@ -1174,7 +1187,7 @@ class CopyTradingBot {
     }
 
     // Execute sell all
-    const results = await executor.sellAllPositions(currentPrices);
+    const results = await sellAllPositions(currentPrices);
 
     // Update trade count
     this.tradeCount += results.filter((r) => r.status === "filled").length;
@@ -1297,7 +1310,7 @@ async function main() {
     }
     console.log("╚═══════════════════════════════════════════════════════════╝");
 
-    // If paper trading, show detailed summary
+    // Show detailed summary
     const executor = bot.getExecutor();
     if (executor instanceof PaperTradingExecutor) {
       const summary = executor.getSummary();
@@ -1319,6 +1332,19 @@ async function main() {
             `  ${i + 1}. ${trade.side} ${trade.size} @ $${trade.price.toFixed(4)} = $${trade.cost.toFixed(2)}`
           );
         });
+      }
+    } else if (executor instanceof LiveTradingExecutor) {
+      const positions = await executor.getAllPositions();
+      console.log("");
+      console.log("Live Trading Details:");
+      console.log(`  Total P&L:        $${executor.getTotalPnL().toFixed(2)}`);
+      console.log(`  Open Positions:   ${positions.size}`);
+
+      // Cancel any remaining open orders on shutdown
+      try {
+        await executor.cancelAllOrders();
+      } catch {
+        // Ignore — shutting down
       }
     }
 

@@ -66,24 +66,11 @@ export function createPaperExecutor(initialBalance?: number): PaperTradingExecut
  * Create a live trading executor
  */
 export function createLiveExecutor(): LiveTradingExecutor {
-  const walletAddress = process.env.MY_WALLET_ADDRESS || "";
   const privateKey = process.env.MY_PRIVATE_KEY || "";
+  const funderAddress = process.env.FUNDER_ADDRESS || "";
+  const signatureType = parseInt(process.env.SIGNATURE_TYPE || "2"); // Default: POLY_GNOSIS_SAFE
 
-  // Safety check
-  if (!walletAddress || walletAddress === "0x0000000000000000000000000000000000000000") {
-    console.error("");
-    console.error("╔═════════════════════════════════════════════════════╗");
-    console.error("║  ERROR: LIVE TRADING REQUIRES WALLET CONFIGURATION  ║");
-    console.error("╠═════════════════════════════════════════════════════╣");
-    console.error("║  Set MY_WALLET_ADDRESS in your .env file            ║");
-    console.error("║  Set MY_PRIVATE_KEY in your .env file               ║");
-    console.error("║                                                     ║");
-    console.error("║  Or use TRADING_MODE=paper for testing              ║");
-    console.error("╚═════════════════════════════════════════════════════╝");
-    console.error("");
-    throw new Error("Live trading requires wallet configuration");
-  }
-
+  // Safety checks
   if (!privateKey) {
     console.error("");
     console.error("╔═════════════════════════════════════════════════════╗");
@@ -98,18 +85,42 @@ export function createLiveExecutor(): LiveTradingExecutor {
     throw new Error("Live trading requires private key");
   }
 
+  if (!funderAddress || funderAddress === "0x0000000000000000000000000000000000000000") {
+    console.error("");
+    console.error("╔═════════════════════════════════════════════════════╗");
+    console.error("║  ERROR: LIVE TRADING REQUIRES FUNDER ADDRESS        ║");
+    console.error("╠═════════════════════════════════════════════════════╣");
+    console.error("║  Set FUNDER_ADDRESS in your .env file               ║");
+    console.error("║  This is your Polymarket proxy wallet address       ║");
+    console.error("║  Find it at: polymarket.com/settings                ║");
+    console.error("║                                                     ║");
+    console.error("║  Or use TRADING_MODE=paper for testing              ║");
+    console.error("╚═════════════════════════════════════════════════════╝");
+    console.error("");
+    throw new Error("Live trading requires funder address");
+  }
+
   console.log("");
   console.log("╔═════════════════════════════════════════════════════╗");
-  console.log("║  ⚠️  LIVE TRADING MODE                               ║");
+  console.log("║  *** LIVE TRADING MODE ***                          ║");
   console.log("║  REAL MONEY WILL BE USED                            ║");
   console.log("╠═════════════════════════════════════════════════════╣");
-  console.log(`║  Wallet: ${walletAddress.slice(0, 10)}...${walletAddress.slice(-8).padEnd(30)}║`);
+  console.log(`║  Funder:  ${funderAddress.slice(0, 10)}...${funderAddress.slice(-8).padEnd(28)}║`);
+  console.log(`║  SigType: ${signatureType === 0 ? "EOA" : signatureType === 1 ? "POLY_PROXY" : "POLY_GNOSIS_SAFE".padEnd(38)}║`);
   console.log("╚═════════════════════════════════════════════════════╝");
   console.log("");
 
   const config: LiveExecutorConfig = {
-    walletAddress,
     privateKey,
+    funderAddress,
+    signatureType,
+    clobApiUrl: process.env.CLOB_API_URL || undefined,
+    chainId: process.env.CHAIN_ID ? parseInt(process.env.CHAIN_ID) : undefined,
+    apiKey: process.env.CLOB_API_KEY || undefined,
+    apiSecret: process.env.CLOB_SECRET || undefined,
+    apiPassphrase: process.env.CLOB_PASSPHRASE || undefined,
+    orderFillTimeoutSeconds: parseInt(process.env.ORDER_FILL_TIMEOUT_SECONDS || "30"),
+    orderStatusPollIntervalMs: parseInt(process.env.ORDER_STATUS_POLL_INTERVAL_MS || "1000"),
   };
 
   return new LiveTradingExecutor(config);

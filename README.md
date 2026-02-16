@@ -1,6 +1,6 @@
-# Polymarket Copy Trading Bot 🤖
+# P-C-t-bt-v0.1
 
-A bot that automatically copies trades from successful Polymarket traders.
+A bot that automatically copies trades from successful traders.
 
 ## How It Works
 
@@ -34,7 +34,6 @@ npm install
 cp .env.example .env
 
 # Edit .env and add your trader address
-# Find traders at: https://polymarket.com/leaderboard
 ```
 
 ### 3. Run Tests
@@ -69,7 +68,7 @@ copy-trading-bot_v2/
 ├── src/
 │   ├── index.ts              # Main entry point
 │   ├── types/                # TypeScript types
-│   ├── api/                  # Polymarket API client
+│   ├── api/                  #  API client
 │   ├── polling/              # Position polling system
 │   │   ├── position-poller.ts    # Main polling loop
 │   │   ├── position-cache.ts     # Cache for positions

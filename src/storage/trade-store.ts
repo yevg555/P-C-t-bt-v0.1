@@ -272,6 +272,7 @@ export class TradeStore {
     result: OrderResult;
     traderAddress?: string;
     traderPrice?: number;
+    pnl?: number;
     detectionLatencyMs?: number;
     executionLatencyMs?: number;
     totalLatencyMs?: number;
@@ -292,7 +293,7 @@ export class TradeStore {
       status: result.status,
       executionMode: result.executionMode,
       orderType: result.orderType || order.orderType || null,
-      pnl: null, // Calculated later for sells
+      pnl: params.pnl ?? null,
       detectionLatencyMs: params.detectionLatencyMs || null,
       executionLatencyMs: params.executionLatencyMs || null,
       totalLatencyMs: params.totalLatencyMs || null,

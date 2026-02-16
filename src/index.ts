@@ -566,6 +566,9 @@ class CopyTradingBot {
     // Step 7: Execute the order
     console.log(`[EXEC] Executing ${order.side} ${order.size} @ $${order.price.toFixed(4)}...`);
 
+    // Snapshot P&L before execution to compute per-trade P&L for sells
+    const pnlBefore = this.getPnlFromExecutor();
+
     try {
       const result = await this.executor.execute(order);
 
@@ -579,6 +582,11 @@ class CopyTradingBot {
 
       // Record latency sample (use corrected values)
       this.recordLatencySample(detectionLatencyCorrected, executionLatencyMs, totalLatencyCorrected);
+
+      // Compute per-trade P&L for sells
+      const tradePnl = order.side === "SELL" && result.status === "filled"
+        ? this.getPnlFromExecutor() - pnlBefore
+        : undefined;
 
       if (result.status === "filled") {
         this.tradeCount++;
@@ -603,6 +611,7 @@ class CopyTradingBot {
           result,
           traderAddress: this.traderConfig.address,
           traderPrice: trade.price,
+          pnl: tradePnl,
           detectionLatencyMs: Math.round(detectionLatencyCorrected),
           executionLatencyMs,
           totalLatencyMs: Math.round(totalLatencyCorrected),
@@ -616,6 +625,18 @@ class CopyTradingBot {
 
     console.log("=".repeat(60));
     console.log("");
+  }
+
+  /**
+   * Get current total P&L from the executor (for computing per-trade P&L deltas)
+   */
+  private getPnlFromExecutor(): number {
+    if (this.executor instanceof PaperTradingExecutor) {
+      return this.executor.getTotalPnL();
+    } else if (this.executor instanceof LiveTradingExecutor) {
+      return this.executor.getTotalPnL();
+    }
+    return 0;
   }
 
   /**
@@ -676,8 +697,14 @@ class CopyTradingBot {
     console.log(`Change: ${(event.percentChange * 100).toFixed(2)}%`);
     console.log("=".repeat(60));
 
+    const pnlBefore = this.getPnlFromExecutor();
+
     try {
       const result = await this.executor.execute(event.order);
+
+      const tradePnl = result.status === "filled"
+        ? this.getPnlFromExecutor() - pnlBefore
+        : undefined;
 
       if (result.status === "filled") {
         this.tradeCount++;
@@ -692,6 +719,7 @@ class CopyTradingBot {
           order: event.order,
           result,
           traderAddress: this.traderConfig.address,
+          pnl: tradePnl,
         });
       } catch (dbError) {
         console.warn(`[DB] Failed to persist TP/SL trade: ${dbError}`);
@@ -828,10 +856,16 @@ class CopyTradingBot {
     // Step 7: Execute the order
     console.log(`[EXEC] Executing ${order.side} ${order.size} @ $${order.price.toFixed(4)}...`);
 
+    const pnlBeforeLegacy = this.getPnlFromExecutor();
+
     try {
       const result = await this.executor.execute(order);
 
       const latencyMs = Date.now() - startTime;
+
+      const tradePnl = order.side === "SELL" && result.status === "filled"
+        ? this.getPnlFromExecutor() - pnlBeforeLegacy
+        : undefined;
 
       if (result.status === "filled") {
         this.tradeCount++;
@@ -849,6 +883,7 @@ class CopyTradingBot {
           order,
           result,
           traderAddress: this.traderConfig.address,
+          pnl: tradePnl,
           executionLatencyMs: latencyMs,
         });
       } catch (dbError) {
@@ -1342,8 +1377,14 @@ class CopyTradingBot {
       ? (pollerStats as { tradesDetected: number }).tradesDetected
       : ('changesDetected' in pollerStats ? (pollerStats as { changesDetected: number }).changesDetected : 0);
 
+    let endingBalance = 0;
     try {
-      const endingBalance = await this.executor.getBalance();
+      endingBalance = await this.executor.getBalance();
+    } catch {
+      // Balance fetch failed (e.g., network issue in live mode) — use 0 as fallback
+    }
+
+    try {
       this.tradeStore.endSession({
         pollsCompleted: pollerStats.pollCount,
         tradesDetected,
@@ -1352,7 +1393,7 @@ class CopyTradingBot {
         endingBalance,
       });
     } catch {
-      // Ignore errors during shutdown
+      // Ignore DB errors during shutdown
     }
 
     this.tradeStore.close();

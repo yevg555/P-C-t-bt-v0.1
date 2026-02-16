@@ -25,6 +25,7 @@
   "author": "Yevgeny",
   "license": "MIT",
   "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^20.10.0",
     "@types/ws": "^8.18.1",
     "ts-node": "^10.9.2",
@@ -35,6 +36,7 @@
     "@ethersproject/providers": "^5.8.0",
     "@ethersproject/wallet": "^5.8.0",
     "@polymarket/clob-client": "^5.2.3",
+    "better-sqlite3": "^12.6.2",
     "dotenv": "^16.3.1",
     "ethers": "^5.8.0",
     "eventemitter3": "^5.0.1",

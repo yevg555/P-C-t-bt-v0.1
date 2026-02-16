@@ -41,6 +41,7 @@ import {
   TraderConfig,
   MarketAnalysisConfig,
 } from "./types";
+import { TradeStore } from "./storage";
 
 /**
  * Polling method determines how we detect trader's trades
@@ -93,6 +94,9 @@ class CopyTradingBot {
 
   // Hybrid WebSocket trigger (Tier 3H)
   private marketWebSocket: MarketWebSocket | null = null;
+
+  // Trade history persistence
+  private tradeStore: TradeStore;
 
   // Tracking state
   private dailyPnL: number = 0;
@@ -226,6 +230,10 @@ class CopyTradingBot {
     // Price optimization: use trader's execution price instead of fetching market price
     // Only effective when using activity polling (which provides exact trade prices)
     this.useTraderPrice = process.env.USE_TRADER_PRICE === "true";
+
+    // Trade history persistence (SQLite)
+    const dbPath = process.env.TRADE_DB_PATH || undefined;
+    this.tradeStore = new TradeStore(dbPath);
 
     this.setupEventHandlers();
   }
@@ -587,6 +595,21 @@ class CopyTradingBot {
       } else {
         console.log(`[EXEC] ${result.status.toUpperCase()}: ${result.error || "Unknown error"}`);
       }
+
+      // Persist trade to database
+      try {
+        this.tradeStore.recordTrade({
+          order,
+          result,
+          traderAddress: this.traderConfig.address,
+          traderPrice: trade.price,
+          detectionLatencyMs: Math.round(detectionLatencyCorrected),
+          executionLatencyMs,
+          totalLatencyMs: Math.round(totalLatencyCorrected),
+        });
+      } catch (dbError) {
+        console.warn(`[DB] Failed to persist trade: ${dbError}`);
+      }
     } catch (error) {
       console.error(`[EXEC] Execution failed: ${error}`);
     }
@@ -661,6 +684,17 @@ class CopyTradingBot {
         console.log(`[TP/SL] SELL FILLED: ${result.filledSize} shares @ $${result.avgFillPrice?.toFixed(4)}`);
       } else {
         console.log(`[TP/SL] SELL ${result.status.toUpperCase()}: ${result.error || "Unknown error"}`);
+      }
+
+      // Persist TP/SL trade to database
+      try {
+        this.tradeStore.recordTrade({
+          order: event.order,
+          result,
+          traderAddress: this.traderConfig.address,
+        });
+      } catch (dbError) {
+        console.warn(`[DB] Failed to persist TP/SL trade: ${dbError}`);
       }
     } catch (error) {
       console.error(`[TP/SL] Execution failed: ${error}`);
@@ -797,16 +831,28 @@ class CopyTradingBot {
     try {
       const result = await this.executor.execute(order);
 
-      const latency = Date.now() - startTime;
+      const latencyMs = Date.now() - startTime;
 
       if (result.status === "filled") {
         this.tradeCount++;
         console.log(`[EXEC] FILLED: ${result.filledSize} shares @ $${result.avgFillPrice?.toFixed(4) || order.price.toFixed(4)}`);
         console.log(`[EXEC] Order ID: ${result.orderId}`);
         console.log(`[EXEC] Mode: ${result.executionMode.toUpperCase()}`);
-        console.log(`[EXEC] Latency: ${latency}ms (detection → execution)`);
+        console.log(`[EXEC] Latency: ${latencyMs}ms (detection → execution)`);
       } else {
         console.log(`[EXEC] ${result.status.toUpperCase()}: ${result.error || "Unknown error"}`);
+      }
+
+      // Persist trade to database
+      try {
+        this.tradeStore.recordTrade({
+          order,
+          result,
+          traderAddress: this.traderConfig.address,
+          executionLatencyMs: latencyMs,
+        });
+      } catch (dbError) {
+        console.warn(`[DB] Failed to persist trade: ${dbError}`);
       }
     } catch (error) {
       console.error(`[EXEC] Execution failed: ${error}`);
@@ -914,6 +960,17 @@ class CopyTradingBot {
 
     // 1-Click Sell
     console.log(`  1-Click Sell:     ${this.oneClickSellEnabled ? "ENABLED (press 'q')" : "DISABLED"}`);
+    console.log("");
+
+    // Start a new persistence session
+    const startingBalance = await this.executor.getBalance();
+    const sessionId = this.tradeStore.startSession({
+      tradingMode: getTradingMode(),
+      pollingMethod: this.pollingMethod,
+      traderAddress: this.traderConfig.address,
+      startingBalance,
+    });
+    console.log(`  Trade History:    ENABLED (session #${sessionId})`);
     console.log("");
 
     // Run startup tests
@@ -1267,6 +1324,39 @@ class CopyTradingBot {
   getExecutor(): OrderExecutor {
     return this.executor;
   }
+
+  /**
+   * Get the trade store (for shutdown summary and external queries)
+   */
+  getTradeStore(): TradeStore {
+    return this.tradeStore;
+  }
+
+  /**
+   * End the current session and close the database
+   */
+  async endSession(): Promise<void> {
+    const stats = this.getStats();
+    const pollerStats = stats.pollerStats;
+    const tradesDetected = 'tradesDetected' in pollerStats
+      ? (pollerStats as { tradesDetected: number }).tradesDetected
+      : ('changesDetected' in pollerStats ? (pollerStats as { changesDetected: number }).changesDetected : 0);
+
+    try {
+      const endingBalance = await this.executor.getBalance();
+      this.tradeStore.endSession({
+        pollsCompleted: pollerStats.pollCount,
+        tradesDetected,
+        tradesExecuted: stats.tradeCount,
+        totalPnl: stats.totalPnL,
+        endingBalance,
+      });
+    } catch {
+      // Ignore errors during shutdown
+    }
+
+    this.tradeStore.close();
+  }
 }
 
 // ============================================
@@ -1347,6 +1437,26 @@ async function main() {
         // Ignore — shutting down
       }
     }
+
+    // Show persistent trade history summary
+    const store = bot.getTradeStore();
+    const perfSummary = store.getPerformanceSummary();
+    if (perfSummary.totalTrades > 0) {
+      console.log("");
+      console.log("Trade History (all sessions):");
+      console.log(`  Total Trades:     ${perfSummary.totalTrades} (${perfSummary.buyCount} buys, ${perfSummary.sellCount} sells)`);
+      console.log(`  Total Volume:     $${perfSummary.totalVolume.toFixed(2)}`);
+      console.log(`  Total P&L:        $${perfSummary.totalPnl.toFixed(2)}`);
+      if (perfSummary.winCount + perfSummary.lossCount > 0) {
+        console.log(`  Win Rate:         ${(perfSummary.winRate * 100).toFixed(1)}% (${perfSummary.winCount}W / ${perfSummary.lossCount}L)`);
+      }
+      if (perfSummary.avgLatencyMs > 0) {
+        console.log(`  Avg Latency:      ${perfSummary.avgLatencyMs.toFixed(0)}ms`);
+      }
+    }
+
+    // End session and close database
+    await bot.endSession();
 
     console.log("");
     process.exit(0);

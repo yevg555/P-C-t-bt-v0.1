@@ -20,6 +20,7 @@ const tests = [
   { name: 'Price Adjuster (Adaptive)', file: 'price-adjuster.test.ts' },
   { name: 'Risk Checker (Market Conditions)', file: 'risk-checker-market.test.ts' },
   { name: 'Copy Size (Depth + Expiration)', file: 'copy-size-depth.test.ts' },
+  { name: 'Trade Store (Persistence)', file: 'trade-store.test.ts' },
 ];
 
 console.log('╔═══════════════════════════════════════════════════╗');

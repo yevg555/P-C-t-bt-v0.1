@@ -566,8 +566,10 @@ class CopyTradingBot {
     // Step 7: Execute the order
     console.log(`[EXEC] Executing ${order.side} ${order.size} @ $${order.price.toFixed(4)}...`);
 
-    // Snapshot P&L before execution to compute per-trade P&L for sells
-    const pnlBefore = this.getPnlFromExecutor();
+    // Capture entry price BEFORE execution so sell P&L can be computed without races
+    const entryPrice = order.side === "SELL"
+      ? this.getEntryPriceForToken(order.tokenId)
+      : undefined;
 
     try {
       const result = await this.executor.execute(order);
@@ -583,9 +585,10 @@ class CopyTradingBot {
       // Record latency sample (use corrected values)
       this.recordLatencySample(detectionLatencyCorrected, executionLatencyMs, totalLatencyCorrected);
 
-      // Compute per-trade P&L for sells
-      const tradePnl = order.side === "SELL" && result.status === "filled"
-        ? this.getPnlFromExecutor() - pnlBefore
+      // Compute per-trade P&L for sells (works for both filled and partial)
+      const fillPrice = result.avgFillPrice || order.price;
+      const tradePnl = order.side === "SELL" && result.filledSize > 0 && entryPrice !== undefined
+        ? (fillPrice - entryPrice) * result.filledSize
         : undefined;
 
       if (result.status === "filled") {
@@ -628,15 +631,16 @@ class CopyTradingBot {
   }
 
   /**
-   * Get current total P&L from the executor (for computing per-trade P&L deltas)
+   * Compute realized P&L for a single sell trade using the position's avg entry price.
+   * Must be called BEFORE the executor processes the sell (so avgPrice is still the buy-side avg).
    */
-  private getPnlFromExecutor(): number {
+  private getEntryPriceForToken(tokenId: string): number | undefined {
     if (this.executor instanceof PaperTradingExecutor) {
-      return this.executor.getTotalPnL();
+      return this.executor.getPositionDetails(tokenId)?.avgPrice;
     } else if (this.executor instanceof LiveTradingExecutor) {
-      return this.executor.getTotalPnL();
+      return this.executor.getPositionDetails(tokenId)?.avgPrice;
     }
-    return 0;
+    return undefined;
   }
 
   /**
@@ -697,13 +701,15 @@ class CopyTradingBot {
     console.log(`Change: ${(event.percentChange * 100).toFixed(2)}%`);
     console.log("=".repeat(60));
 
-    const pnlBefore = this.getPnlFromExecutor();
+    // TP/SL is always a SELL — use entry price from the event itself
+    const entryPrice = event.entryPrice;
 
     try {
       const result = await this.executor.execute(event.order);
 
-      const tradePnl = result.status === "filled"
-        ? this.getPnlFromExecutor() - pnlBefore
+      const fillPrice = result.avgFillPrice || event.order.price;
+      const tradePnl = result.filledSize > 0
+        ? (fillPrice - entryPrice) * result.filledSize
         : undefined;
 
       if (result.status === "filled") {
@@ -856,15 +862,19 @@ class CopyTradingBot {
     // Step 7: Execute the order
     console.log(`[EXEC] Executing ${order.side} ${order.size} @ $${order.price.toFixed(4)}...`);
 
-    const pnlBeforeLegacy = this.getPnlFromExecutor();
+    // Capture entry price BEFORE execution so sell P&L can be computed without races
+    const entryPriceLegacy = order.side === "SELL"
+      ? this.getEntryPriceForToken(order.tokenId)
+      : undefined;
 
     try {
       const result = await this.executor.execute(order);
 
       const latencyMs = Date.now() - startTime;
 
-      const tradePnl = order.side === "SELL" && result.status === "filled"
-        ? this.getPnlFromExecutor() - pnlBeforeLegacy
+      const fillPriceLegacy = result.avgFillPrice || order.price;
+      const tradePnl = order.side === "SELL" && result.filledSize > 0 && entryPriceLegacy !== undefined
+        ? (fillPriceLegacy - entryPriceLegacy) * result.filledSize
         : undefined;
 
       if (result.status === "filled") {

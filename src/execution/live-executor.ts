@@ -547,6 +547,13 @@ export class LiveTradingExecutor implements OrderExecutor {
   }
 
   /**
+   * Get detailed position info for a single token
+   */
+  getPositionDetails(tokenId: string): PaperPosition | undefined {
+    return this.positions.get(tokenId);
+  }
+
+  /**
    * Get all position details (for TP/SL monitoring)
    */
   async getAllPositionDetails(): Promise<Map<string, PaperPosition>> {

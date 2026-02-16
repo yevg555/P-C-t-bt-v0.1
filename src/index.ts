@@ -869,6 +869,13 @@ class CopyTradingBot {
       ? `${this.traderConfig.tag} (${this.traderConfig.address.slice(0, 10)}...)`
       : `${this.traderConfig.address.slice(0, 10)}...`;
 
+    // Initialize live executor BEFORE any getBalance() calls
+    if (this.executor instanceof LiveTradingExecutor) {
+      console.log("  --- Live Executor Initialization ---");
+      await this.executor.initialize();
+      console.log("");
+    }
+
     console.log(`  Mode:            ${getTradingMode().toUpperCase()}`);
     console.log(`  Trader:          ${traderDisplay}`);
     console.log(`  Polling Method:  ${this.pollingMethod.toUpperCase()}`);
@@ -908,13 +915,6 @@ class CopyTradingBot {
     // 1-Click Sell
     console.log(`  1-Click Sell:     ${this.oneClickSellEnabled ? "ENABLED (press 'q')" : "DISABLED"}`);
     console.log("");
-
-    // Initialize live executor if needed (connects wallet, derives API creds)
-    if (this.executor instanceof LiveTradingExecutor) {
-      console.log("  --- Live Executor Initialization ---");
-      await this.executor.initialize();
-      console.log("");
-    }
 
     // Run startup tests
     console.log("  --- Startup Tests ---");

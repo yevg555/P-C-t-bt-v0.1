@@ -54,8 +54,8 @@ export interface LiveExecutorConfig {
   apiKey?: string;
   apiSecret?: string;
   apiPassphrase?: string;
-  /** Max seconds to wait for order fill before giving up (default: 30) */
-  orderFillTimeoutSeconds?: number;
+  /** Extra seconds to poll beyond order expiration (default: 5) */
+  orderFillPollBufferSeconds?: number;
   /** Polling interval for checking order status (ms, default: 1000) */
   orderStatusPollIntervalMs?: number;
   /** Maximum acceptable slippage in basis points (default: 200 = 2%) */
@@ -364,7 +364,10 @@ export class LiveTradingExecutor implements OrderExecutor {
     originalOrder: OrderSpec,
     placedAt: Date,
   ): Promise<OrderResult> {
-    const timeoutMs = (this.config.orderFillTimeoutSeconds ?? 30) * 1000;
+    // Derive poll timeout from the order's own expiration + a small buffer
+    const orderExpirationMs = originalOrder.expiresInMs ?? 30_000;
+    const bufferMs = (this.config.orderFillPollBufferSeconds ?? 5) * 1000;
+    const timeoutMs = orderExpirationMs + bufferMs;
     const pollIntervalMs = this.config.orderStatusPollIntervalMs ?? 1000;
     const deadline = Date.now() + timeoutMs;
 

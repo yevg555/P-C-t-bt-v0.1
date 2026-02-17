@@ -15,9 +15,9 @@ A bot that automatically copies trades from successful traders.
 ## Current Status
 
 - ✅ Phase 1: Position Poller (COMPLETE)
-- ⏳ Phase 2: Strategy Engine (TODO)
-- ⏳ Phase 3: Order Execution (TODO)
-- ⏳ Phase 4: Dashboard (TODO)
+- ✅ Phase 2: Strategy Engine (COMPLETE)
+- ✅ Phase 3: Order Execution (COMPLETE)
+- ✅ Phase 4: Dashboard (COMPLETE)
 
 ## Quick Start
 
@@ -66,15 +66,14 @@ This will watch your configured trader and log when they make trades.
 ```
 copy-trading-bot_v2/
 ├── src/
-│   ├── index.ts              # Main entry point
+│   ├── index.ts              # Main entry point & bot orchestrator
 │   ├── types/                # TypeScript types
-│   ├── api/                  #  API client
-│   ├── polling/              # Position polling system
-│   │   ├── position-poller.ts    # Main polling loop
-│   │   ├── position-cache.ts     # Cache for positions
-│   │   └── change-detector.ts    # Detects buys/sells
-│   ├── strategy/             # (Phase 2) Trade sizing
-│   └── execution/            # (Phase 3) Order execution
+│   ├── api/                  # Polymarket API client
+│   ├── polling/              # Trade detection (activity + positions)
+│   ├── strategy/             # Copy size, risk, price, market analysis, TP/SL
+│   ├── execution/            # Paper & live trading executors
+│   ├── storage/              # SQLite trade history persistence
+│   └── dashboard/            # Web dashboard (REST API + WebSocket)
 ├── tests/                    # Test files
 ├── scripts/                  # Demo & utility scripts
 ├── .env.example              # Configuration template

@@ -654,20 +654,15 @@ export class PolymarketAPI {
   }
 
   /**
-   * Refresh prices for all watched tokens.
+   * Refresh prices for all watched tokens in parallel.
    * Fetches BUY side (ASK) prices — the most common need for copy trading.
-   * Uses rate-limited sequential calls to avoid overwhelming the CLOB API.
    */
   private async warmPriceCache(): Promise<void> {
-    const tokens = Array.from(this.watchedTokenIds);
-    for (const tokenId of tokens) {
-      try {
-        // Warm both BUY and SELL sides
-        await this.getPrice(tokenId, "BUY");
-      } catch {
-        // Silently ignore individual failures — stale cache is still useful
-      }
-    }
+    const requests = Array.from(this.watchedTokenIds).map(tokenId => ({
+      tokenId,
+      side: "BUY" as const,
+    }));
+    await this.getPricesParallel(requests);
   }
 
   /**
@@ -835,14 +830,6 @@ export class PolymarketAPI {
     }
 
     this.lastClobRequestTime = Date.now();
-  }
-
-  /**
-   * @deprecated Use endpoint-specific rate limiters instead
-   */
-  private async respectRateLimit(): Promise<void> {
-    // Fallback to positions rate limit for backward compatibility
-    await this.respectPositionsRateLimit();
   }
 
   private transformPositions(data: unknown): Position[] {

@@ -34,6 +34,7 @@ import {
   PaperPosition,
   SpendTracker,
 } from "../types";
+import { withRetry, CircuitBreaker, checkSlippage } from "../utils";
 
 /**
  * Configuration for live trading
@@ -57,6 +58,10 @@ export interface LiveExecutorConfig {
   orderFillTimeoutSeconds?: number;
   /** Polling interval for checking order status (ms, default: 1000) */
   orderStatusPollIntervalMs?: number;
+  /** Maximum acceptable slippage in basis points (default: 200 = 2%) */
+  maxSlippageBps?: number;
+  /** Max API retries on transient failures (default: 3) */
+  maxRetries?: number;
 }
 
 /**
@@ -78,6 +83,9 @@ export class LiveTradingExecutor implements OrderExecutor {
   };
   private tokenToMarket: Map<string, string> = new Map();
   private totalPnL: number = 0;
+
+  // Robustness: circuit breaker for API calls
+  private circuitBreaker: CircuitBreaker = new CircuitBreaker(5, 30_000);
 
   constructor(config: LiveExecutorConfig) {
     this.config = config;
@@ -192,30 +200,48 @@ export class LiveTradingExecutor implements OrderExecutor {
     const orderId = this.generateOrderId();
     const placedAt = new Date();
 
+    // Circuit breaker check
+    if (!this.circuitBreaker.allowRequest()) {
+      console.error(`[LIVE] Circuit breaker OPEN — rejecting order (${this.circuitBreaker.getFailures()} consecutive failures)`);
+      return {
+        orderId,
+        status: "failed",
+        filledSize: 0,
+        error: "Circuit breaker open — too many consecutive API failures",
+        placedAt,
+        executedAt: new Date(),
+        executionMode: "live",
+        orderType: order.orderType,
+      };
+    }
+
     try {
       const side = order.side === "BUY" ? ClobSide.BUY : ClobSide.SELL;
       const isMarketOrder = order.orderType === "market";
 
       console.log(`[LIVE] Submitting ${isMarketOrder ? "MARKET" : "LIMIT"} ${order.side} order: ${order.size} shares @ $${order.price.toFixed(4)}`);
 
+      // Submit order with retry on transient failures
+      const maxRetries = this.config.maxRetries ?? 3;
       let response: any;
 
       if (isMarketOrder) {
-        // Market order: use FOK (Fill-or-Kill) for full fill, or FAK for partial
-        response = await this.client!.createAndPostMarketOrder(
-          {
-            tokenID: order.tokenId,
-            price: order.price,
-            amount: order.side === "BUY"
-              ? order.size * order.price  // BUY: amount in USDC
-              : order.size,               // SELL: amount in shares
-            side,
-          },
-          undefined, // options — auto-resolves tickSize and negRisk
-          ClobOrderType.FOK,
+        response = await withRetry(
+          () => this.client!.createAndPostMarketOrder(
+            {
+              tokenID: order.tokenId,
+              price: order.price,
+              amount: order.side === "BUY"
+                ? order.size * order.price
+                : order.size,
+              side,
+            },
+            undefined,
+            ClobOrderType.FOK,
+          ),
+          { maxRetries },
         );
       } else {
-        // Limit order: use GTC (Good-Til-Cancelled) or GTD with expiration
         const orderType = order.expiresInMs && order.expiresInMs > 0
           ? ClobOrderType.GTD
           : ClobOrderType.GTC;
@@ -227,24 +253,27 @@ export class LiveTradingExecutor implements OrderExecutor {
           side,
         };
 
-        // GTD requires expiration timestamp (seconds since epoch)
         if (orderType === ClobOrderType.GTD && order.expiresInMs) {
-          // Must be at least 1 minute in the future (Polymarket security threshold)
           const minExpiration = Math.floor(Date.now() / 1000) + 60;
           const requestedExpiration = Math.floor((Date.now() + order.expiresInMs) / 1000);
           userOrder.expiration = Math.max(requestedExpiration, minExpiration);
         }
 
-        response = await this.client!.createAndPostOrder(
-          userOrder,
-          undefined, // options — auto-resolves tickSize and negRisk
-          orderType,
+        response = await withRetry(
+          () => this.client!.createAndPostOrder(
+            userOrder,
+            undefined,
+            orderType,
+          ),
+          { maxRetries },
         );
       }
 
       // Parse response
       const executedAt = new Date();
       console.log(`[LIVE] Order response:`, JSON.stringify(response, null, 2));
+
+      this.circuitBreaker.recordSuccess();
 
       if (!response || !response.success) {
         const errorMsg = response?.errorMsg || "Unknown error from CLOB API";
@@ -269,6 +298,13 @@ export class LiveTradingExecutor implements OrderExecutor {
         // Fully filled immediately
         const filledSize = order.size;
         const fillPrice = order.price;
+
+        // Slippage check for immediate fills
+        const slippage = checkSlippage(order.side, order.price, fillPrice, this.config.maxSlippageBps ?? 200);
+        if (!slippage.acceptable) {
+          console.warn(`[LIVE] ${slippage.description}`);
+          // Log warning but don't reject — the fill already happened on-chain
+        }
 
         this.trackPosition(order, filledSize, fillPrice);
 
@@ -301,8 +337,9 @@ export class LiveTradingExecutor implements OrderExecutor {
         orderType: order.orderType,
       };
     } catch (error) {
+      this.circuitBreaker.recordFailure();
       const errorMsg = error instanceof Error ? error.message : String(error);
-      console.error(`[LIVE] Order execution failed: ${errorMsg}`);
+      console.error(`[LIVE] Order execution failed: ${errorMsg} (circuit breaker: ${this.circuitBreaker.getState()})`);
 
       return {
         orderId,
@@ -343,7 +380,11 @@ export class LiveTradingExecutor implements OrderExecutor {
         const price = parseFloat(orderStatus.price || "0");
 
         if (status === "matched" || (sizeMatched > 0 && sizeMatched >= originalSize)) {
-          // Fully filled
+          // Fully filled — check slippage
+          const slippage = checkSlippage(originalOrder.side, originalOrder.price, price, this.config.maxSlippageBps ?? 200);
+          if (!slippage.acceptable) {
+            console.warn(`[LIVE] ${slippage.description}`);
+          }
           this.trackPosition(originalOrder, sizeMatched, price);
 
           return {

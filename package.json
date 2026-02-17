@@ -15,7 +15,9 @@
     "demo:poller": "ts-node scripts/demo-poller.ts",
     "demo:strategy": "ts-node scripts/demo-strategy.ts",
     "debug:api": "ts-node scripts/debug-api.ts",
-    "test:compare-pollers": "ts-node scripts/compare-positions-latency.ts"
+    "test:compare-pollers": "ts-node scripts/compare-positions-latency.ts",
+    "lint": "eslint src/ tests/",
+    "lint:fix": "eslint src/ tests/ --fix"
   },
   "keywords": [
     "polymarket",
@@ -25,12 +27,18 @@
   "author": "Yevgeny",
   "license": "MIT",
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@types/better-sqlite3": "^7.6.13",
+    "@types/express": "^5.0.6",
     "@types/node": "^20.10.0",
     "@types/ws": "^8.18.1",
+    "@typescript-eslint/eslint-plugin": "^8.56.0",
+    "@typescript-eslint/parser": "^8.56.0",
+    "eslint": "^10.0.0",
     "ts-node": "^10.9.2",
     "ts-node-dev": "^2.0.0",
-    "typescript": "^5.3.0"
+    "typescript": "^5.3.0",
+    "typescript-eslint": "^8.56.0"
   },
   "dependencies": {
     "@ethersproject/providers": "^5.8.0",
@@ -40,6 +48,7 @@
     "dotenv": "^16.3.1",
     "ethers": "^5.8.0",
     "eventemitter3": "^5.0.1",
+    "express": "^5.2.1",
     "undici": "^7.22.0",
     "ws": "^8.19.0"
   }

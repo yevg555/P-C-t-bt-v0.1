@@ -1,0 +1,18 @@
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: polymarket-copy-bot
+    restart: unless-stopped
+    ports:
+      - "3456:3456"
+    volumes:
+      # Persist SQLite database across container restarts
+      - ./data:/app/data
+      # Mount environment variables (read-only)
+      - ./.env:/app/.env:ro
+    environment:
+      - NODE_ENV=production
+    # Graceful shutdown timeout (let open orders settle)
+    stop_grace_period: 30s

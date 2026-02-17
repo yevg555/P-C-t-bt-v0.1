@@ -42,6 +42,8 @@ import {
   MarketAnalysisConfig,
 } from "./types";
 import { TradeStore } from "./storage";
+import { DashboardServer } from "./dashboard";
+import { AlertService } from "./alerts";
 
 /**
  * Polling method determines how we detect trader's trades
@@ -88,6 +90,7 @@ class CopyTradingBot {
 
   // Portfolio value prefetch interval
   private portfolioValuePrefetchInterval: NodeJS.Timeout | null = null;
+  private isPrefetching = false;
 
   // Watched token IDs for price cache warming (from trader's positions)
   private watchedTokenIds: Set<string> = new Set();
@@ -98,17 +101,25 @@ class CopyTradingBot {
   // Trade history persistence
   private tradeStore: TradeStore;
 
+  // Dashboard server
+  private dashboard: DashboardServer | null = null;
+
+  // Alert/notification service
+  private alertService: AlertService;
+
   // Tracking state
   private dailyPnL: number = 0;
   private totalPnL: number = 0;
   private tradeCount: number = 0;
 
-  // Latency tracking
+  // Latency tracking (ring buffer for O(1) insert)
   private latencySamples: Array<{
     detectionLatencyMs: number;
     executionLatencyMs: number;
     totalLatencyMs: number;
   }> = [];
+  private latencyWriteIndex: number = 0;
+  private latencySampleCount: number = 0;
   private maxLatencySamples: number = 100;
 
   // Clock drift calibration (measured on startup)
@@ -235,6 +246,14 @@ class CopyTradingBot {
     const dbPath = process.env.TRADE_DB_PATH || undefined;
     this.tradeStore = new TradeStore(dbPath);
 
+    // Alert/notification service
+    this.alertService = new AlertService({
+      telegramBotToken: process.env.TELEGRAM_BOT_TOKEN,
+      telegramChatId: process.env.TELEGRAM_CHAT_ID,
+      discordWebhookUrl: process.env.DISCORD_WEBHOOK_URL,
+      minSeverity: (process.env.ALERT_MIN_SEVERITY as "critical" | "high" | "medium" | "low") || "high",
+    });
+
     this.setupEventHandlers();
   }
 
@@ -258,10 +277,12 @@ class CopyTradingBot {
         console.log("   Check your internet connection and API status");
         console.log(`   Consecutive errors: ${errorCount}`);
         console.log("");
+        this.alertService.pollerDegraded(errorCount);
       });
 
       this.activityPoller.on("recovered", () => {
         console.log("[BOT] Poller recovered from errors");
+        this.alertService.pollerRecovered();
       });
     } else if (this.positionPoller) {
       // Position-based polling (legacy)
@@ -279,10 +300,12 @@ class CopyTradingBot {
         console.log("   Check your internet connection and API status");
         console.log(`   Consecutive errors: ${errorCount}`);
         console.log("");
+        this.alertService.pollerDegraded(errorCount);
       });
 
       this.positionPoller.on("recovered", () => {
         console.log("[BOT] Poller recovered from errors");
+        this.alertService.pollerRecovered();
       });
     }
 
@@ -443,6 +466,7 @@ class CopyTradingBot {
 
     if (!marketRisk.approved) {
       console.log(`[RISK] MARKET REJECTED: ${marketRisk.reason}`);
+      this.alertService.tradeRejected(`Market: ${marketRisk.reason}`);
       return;
     }
     if (marketRisk.warnings.length > 0) {
@@ -547,6 +571,7 @@ class CopyTradingBot {
 
     if (!riskResult.approved) {
       console.log(`[RISK] REJECTED: ${riskResult.reason}`);
+      this.alertService.tradeRejected(`Risk: ${riskResult.reason}`);
       return;
     }
 
@@ -619,11 +644,22 @@ class CopyTradingBot {
           executionLatencyMs,
           totalLatencyMs: Math.round(totalLatencyCorrected),
         });
+        this.dashboard?.notifyTrade({
+          side: order.side, size: result.filledSize,
+          price: result.avgFillPrice || order.price, pnl: tradePnl,
+          status: result.status, tokenId: order.tokenId,
+        });
       } catch (dbError) {
         console.warn(`[DB] Failed to persist trade: ${dbError}`);
       }
+
+      // Send alert for filled trades
+      if (result.status === "filled" || result.filledSize > 0) {
+        this.alertService.tradeFilled(order.side, result.filledSize, fillPrice, tradePnl);
+      }
     } catch (error) {
       console.error(`[EXEC] Execution failed: ${error}`);
+      this.alertService.tradeFailed(String(error));
     }
 
     console.log("=".repeat(60));
@@ -647,9 +683,11 @@ class CopyTradingBot {
    * Record a latency sample for statistics
    */
   private recordLatencySample(detectionLatencyMs: number, executionLatencyMs: number, totalLatencyMs: number): void {
-    this.latencySamples.push({ detectionLatencyMs, executionLatencyMs, totalLatencyMs });
-    if (this.latencySamples.length > this.maxLatencySamples) {
-      this.latencySamples.shift();
+    // Ring buffer: O(1) insert, no shift/splice needed
+    this.latencySamples[this.latencyWriteIndex] = { detectionLatencyMs, executionLatencyMs, totalLatencyMs };
+    this.latencyWriteIndex = (this.latencyWriteIndex + 1) % this.maxLatencySamples;
+    if (this.latencySampleCount < this.maxLatencySamples) {
+      this.latencySampleCount++;
     }
   }
 
@@ -663,7 +701,8 @@ class CopyTradingBot {
     sampleCount: number;
     clockDriftOffset: number;
   } {
-    if (this.latencySamples.length === 0) {
+    const count = this.latencySampleCount;
+    if (count === 0) {
       return {
         avgDetectionMs: 0,
         avgExecutionMs: 0,
@@ -673,10 +712,15 @@ class CopyTradingBot {
       };
     }
 
-    const sumDetection = this.latencySamples.reduce((a, b) => a + b.detectionLatencyMs, 0);
-    const sumExecution = this.latencySamples.reduce((a, b) => a + b.executionLatencyMs, 0);
-    const sumTotal = this.latencySamples.reduce((a, b) => a + b.totalLatencyMs, 0);
-    const count = this.latencySamples.length;
+    let sumDetection = 0;
+    let sumExecution = 0;
+    let sumTotal = 0;
+    for (let i = 0; i < count; i++) {
+      const s = this.latencySamples[i];
+      sumDetection += s.detectionLatencyMs;
+      sumExecution += s.executionLatencyMs;
+      sumTotal += s.totalLatencyMs;
+    }
 
     return {
       avgDetectionMs: Math.round(sumDetection / count),
@@ -704,6 +748,11 @@ class CopyTradingBot {
     // TP/SL is always a SELL — use entry price from the event itself
     const entryPrice = event.entryPrice;
 
+    // Alert for TP/SL trigger
+    this.alertService.tpSlTriggered(
+      event.triggerType, event.tokenId, event.entryPrice, event.currentPrice, event.percentChange
+    );
+
     try {
       const result = await this.executor.execute(event.order);
 
@@ -727,11 +776,21 @@ class CopyTradingBot {
           traderAddress: this.traderConfig.address,
           pnl: tradePnl,
         });
+        this.dashboard?.notifyTrade({
+          side: event.order.side, size: result.filledSize,
+          price: result.avgFillPrice || event.order.price, pnl: tradePnl,
+          status: result.status, tokenId: event.tokenId,
+        });
       } catch (dbError) {
         console.warn(`[DB] Failed to persist TP/SL trade: ${dbError}`);
       }
+
+      if (result.status === "filled" || result.filledSize > 0) {
+        this.alertService.tradeFilled("SELL", result.filledSize, fillPrice, tradePnl);
+      }
     } catch (error) {
       console.error(`[TP/SL] Execution failed: ${error}`);
+      this.alertService.tradeFailed(`TP/SL: ${error}`);
     }
 
     console.log("=".repeat(60));
@@ -849,6 +908,7 @@ class CopyTradingBot {
 
     if (!riskResult.approved) {
       console.log(`[RISK] REJECTED: ${riskResult.reason}`);
+      this.alertService.tradeRejected(`Risk: ${riskResult.reason}`);
       return;
     }
 
@@ -896,11 +956,21 @@ class CopyTradingBot {
           pnl: tradePnl,
           executionLatencyMs: latencyMs,
         });
+        this.dashboard?.notifyTrade({
+          side: order.side, size: result.filledSize,
+          price: result.avgFillPrice || order.price, pnl: tradePnl,
+          status: result.status, tokenId: order.tokenId,
+        });
       } catch (dbError) {
         console.warn(`[DB] Failed to persist trade: ${dbError}`);
       }
+
+      if (result.status === "filled" || result.filledSize > 0) {
+        this.alertService.tradeFilled(order.side, result.filledSize, fillPriceLegacy, tradePnl);
+      }
     } catch (error) {
       console.error(`[EXEC] Execution failed: ${error}`);
+      this.alertService.tradeFailed(String(error));
     }
 
     console.log("=".repeat(60));
@@ -1016,7 +1086,22 @@ class CopyTradingBot {
       startingBalance,
     });
     console.log(`  Trade History:    ENABLED (session #${sessionId})`);
+
+    // Start dashboard server
+    const dashboardEnabled = process.env.DASHBOARD_ENABLED !== "false";
+    if (dashboardEnabled) {
+      const dashboardPort = parseInt(process.env.DASHBOARD_PORT || "3456", 10);
+      this.dashboard = new DashboardServer(this, dashboardPort);
+      await this.dashboard.start();
+      console.log(`  Dashboard:        http://localhost:${dashboardPort}`);
+    } else {
+      console.log(`  Dashboard:        DISABLED`);
+    }
+    console.log(`  Alerts:           ${this.alertService.getStatus()}`);
     console.log("");
+
+    // Send session started alert
+    this.alertService.sessionStarted(getTradingMode(), startingBalance);
 
     // Run startup tests
     console.log("  --- Startup Tests ---");
@@ -1120,10 +1205,14 @@ class CopyTradingBot {
     // Set up periodic prefetch (every 30 seconds to keep cache warm)
     const prefetchIntervalMs = 30000;
     this.portfolioValuePrefetchInterval = setInterval(async () => {
+      if (this.isPrefetching) return; // Prevent overlapping prefetches
+      this.isPrefetching = true;
       try {
         await this.api.prefetchPortfolioValue(traderAddress);
       } catch {
         // Silently ignore prefetch errors
+      } finally {
+        this.isPrefetching = false;
       }
     }, prefetchIntervalMs);
   }
@@ -1215,17 +1304,9 @@ class CopyTradingBot {
     this.tpSlMonitor.startMonitoring(
       async () => executor.getAllPositionDetails!(),
       async (tokenIds: string[]) => {
-        const prices = new Map<string, number>();
-        for (const tokenId of tokenIds) {
-          try {
-            // Get price for monitoring (use BUY side as reference)
-            const price = await this.api.getPrice(tokenId, "SELL");
-            prices.set(tokenId, price);
-          } catch {
-            // Skip if price fetch fails
-          }
-        }
-        return prices;
+        // Fetch all prices in parallel instead of sequentially
+        const requests = tokenIds.map(tokenId => ({ tokenId, side: "SELL" as const }));
+        return this.api.getPricesParallel(requests);
       }
     );
   }
@@ -1276,16 +1357,17 @@ class CopyTradingBot {
       return;
     }
 
-    // Get current prices for all positions
+    // Fetch all prices in parallel instead of sequentially
+    const requests = Array.from(positions.keys()).map(tokenId => ({
+      tokenId,
+      side: "SELL" as const,
+    }));
+    const fetchedPrices = await this.api.getPricesParallel(requests);
+
+    // Build final price map with fallbacks for failed fetches
     const currentPrices = new Map<string, number>();
     for (const [tokenId, position] of positions) {
-      try {
-        const price = await this.api.getPrice(tokenId, "SELL");
-        currentPrices.set(tokenId, price);
-      } catch {
-        // Use avgPrice as fallback
-        currentPrices.set(tokenId, position.avgPrice);
-      }
+      currentPrices.set(tokenId, fetchedPrices.get(tokenId) ?? position.avgPrice);
     }
 
     // Execute sell all
@@ -1319,6 +1401,12 @@ class CopyTradingBot {
     if (this.marketWebSocket) {
       this.marketWebSocket.stop();
       this.marketWebSocket = null;
+    }
+
+    // Stop dashboard server
+    if (this.dashboard) {
+      this.dashboard.stop();
+      this.dashboard = null;
     }
 
     // Clean up keyboard listener
@@ -1405,6 +1493,9 @@ class CopyTradingBot {
     } catch {
       // Ignore DB errors during shutdown
     }
+
+    // Send session ended alert (fire-and-forget)
+    this.alertService.sessionEnded(stats.tradeCount, stats.totalPnL).catch(() => {});
 
     this.tradeStore.close();
   }

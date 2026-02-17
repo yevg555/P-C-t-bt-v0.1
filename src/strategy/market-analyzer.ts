@@ -58,16 +58,22 @@ export class MarketAnalyzer {
     const now = new Date();
     const conditionReasons: string[] = [];
 
-    // Parse and sort the book
-    const asks = orderBook.asks
-      .map((a) => ({ price: parseFloat(a.price), size: parseFloat(a.size) }))
-      .filter((a) => a.price > 0 && a.size > 0)
-      .sort((a, b) => a.price - b.price); // Ascending (cheapest first)
+    // Parse and sort the book (single pass — no intermediate arrays)
+    const asks: Array<{ price: number; size: number }> = [];
+    for (const a of orderBook.asks) {
+      const price = parseFloat(a.price);
+      const size = parseFloat(a.size);
+      if (price > 0 && size > 0) asks.push({ price, size });
+    }
+    asks.sort((a, b) => a.price - b.price); // Ascending (cheapest first)
 
-    const bids = orderBook.bids
-      .map((b) => ({ price: parseFloat(b.price), size: parseFloat(b.size) }))
-      .filter((b) => b.price > 0 && b.size > 0)
-      .sort((a, b) => b.price - a.price); // Descending (highest first)
+    const bids: Array<{ price: number; size: number }> = [];
+    for (const b of orderBook.bids) {
+      const price = parseFloat(b.price);
+      const size = parseFloat(b.size);
+      if (price > 0 && size > 0) bids.push({ price, size });
+    }
+    bids.sort((a, b) => b.price - a.price); // Descending (highest first)
 
     // Best prices (fallback to trader price if book is empty)
     const bestAsk = asks.length > 0 ? asks[0].price : traderPrice;
@@ -82,13 +88,17 @@ export class MarketAnalyzer {
     const askCeiling = bestAsk * (1 + this.config.depthRangePercent);
     const bidFloor = bestBid * (1 - this.config.depthRangePercent);
 
-    const askDepthNear = asks
-      .filter((a) => a.price <= askCeiling)
-      .reduce((sum, a) => sum + a.size, 0);
+    let askDepthNear = 0;
+    for (const a of asks) {
+      if (a.price > askCeiling) break; // asks are sorted ascending
+      askDepthNear += a.size;
+    }
 
-    const bidDepthNear = bids
-      .filter((b) => b.price >= bidFloor)
-      .reduce((sum, b) => sum + b.size, 0);
+    let bidDepthNear = 0;
+    for (const b of bids) {
+      if (b.price < bidFloor) break; // bids are sorted descending
+      bidDepthNear += b.size;
+    }
 
     // Weighted average fill price for our target size
     const weightedAskForSize = targetSize

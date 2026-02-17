@@ -107,8 +107,10 @@ export class ActivityPoller extends EventEmitter<ActivityPollerEvents> {
   // Immediate poll trigger (used by WebSocket hybrid)
   private pollTriggerResolve: (() => void) | null = null;
 
-  // Latency tracking
+  // Latency tracking (ring buffer for O(1) insert)
   private latencySamples: number[] = [];
+  private latencyWriteIndex = 0;
+  private latencySampleCount = 0;
   private maxLatencySamples = 100;
 
   constructor(config: PollerConfig, api?: PolymarketAPI) {
@@ -313,10 +315,15 @@ export class ActivityPoller extends EventEmitter<ActivityPollerEvents> {
       this.consecutiveErrors = 0;
 
       // Limit the size of seenTradeIds to prevent memory leaks
+      // Delete oldest entries in-place (Set iterates in insertion order)
       if (this.seenTradeIds.size > 1000) {
-        // Keep only the most recent 500
-        const idsArray = Array.from(this.seenTradeIds);
-        this.seenTradeIds = new Set(idsArray.slice(-500));
+        const toRemove = this.seenTradeIds.size - 500;
+        let removed = 0;
+        for (const id of this.seenTradeIds) {
+          if (removed >= toRemove) break;
+          this.seenTradeIds.delete(id);
+          removed++;
+        }
       }
 
       // Log progress periodically
@@ -334,9 +341,11 @@ export class ActivityPoller extends EventEmitter<ActivityPollerEvents> {
    * Record a latency sample
    */
   private recordLatency(latencyMs: number): void {
-    this.latencySamples.push(latencyMs);
-    if (this.latencySamples.length > this.maxLatencySamples) {
-      this.latencySamples.shift();
+    // Ring buffer: O(1) insert, no shift needed
+    this.latencySamples[this.latencyWriteIndex] = latencyMs;
+    this.latencyWriteIndex = (this.latencyWriteIndex + 1) % this.maxLatencySamples;
+    if (this.latencySampleCount < this.maxLatencySamples) {
+      this.latencySampleCount++;
     }
   }
 
@@ -419,7 +428,8 @@ export class ActivityPoller extends EventEmitter<ActivityPollerEvents> {
    * Get latency statistics
    */
   getLatencyStats(): LatencyStats {
-    if (this.latencySamples.length === 0) {
+    const count = this.latencySampleCount;
+    if (count === 0) {
       return {
         avgDetectionLatencyMs: 0,
         minDetectionLatencyMs: 0,
@@ -428,12 +438,20 @@ export class ActivityPoller extends EventEmitter<ActivityPollerEvents> {
       };
     }
 
-    const sum = this.latencySamples.reduce((a, b) => a + b, 0);
+    let sum = 0;
+    let min = Infinity;
+    let max = -Infinity;
+    for (let i = 0; i < count; i++) {
+      const v = this.latencySamples[i];
+      sum += v;
+      if (v < min) min = v;
+      if (v > max) max = v;
+    }
     return {
-      avgDetectionLatencyMs: sum / this.latencySamples.length,
-      minDetectionLatencyMs: Math.min(...this.latencySamples),
-      maxDetectionLatencyMs: Math.max(...this.latencySamples),
-      sampleCount: this.latencySamples.length,
+      avgDetectionLatencyMs: sum / count,
+      minDetectionLatencyMs: min,
+      maxDetectionLatencyMs: max,
+      sampleCount: count,
     };
   }
 

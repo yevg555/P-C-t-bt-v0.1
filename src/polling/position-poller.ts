@@ -63,9 +63,9 @@ export class PositionPoller extends EventEmitter<PollerEvents> {
   private config: PollerConfig;
   
   // State
-  private intervalId: NodeJS.Timeout | null = null;
   private isRunning = false;
   private isPaused = false;
+  private shouldStop = false;
   private consecutiveErrors = 0;
   private pollCount = 0;
   private changesDetected = 0;
@@ -102,21 +102,40 @@ export class PositionPoller extends EventEmitter<PollerEvents> {
     console.log('='.repeat(50) + '\n');
     
     this.isRunning = true;
+    this.shouldStop = false;
     this.emit('start');
-    
+
     // Do first poll immediately
     await this.poll();
-    
-    // Then poll on interval
-    this.intervalId = setInterval(() => {
-      if (!this.isPaused) {
-        this.poll().catch(err => {
-          console.error('[Poller] Unhandled error:', err);
-        });
-      }
-    }, this.config.intervalMs);
-    
+
     console.log('[Poller] ✅ Polling started\n');
+
+    // Tight poll loop: accounts for poll duration, no wasted time
+    this.runPollLoop();
+  }
+
+  /**
+   * Tight poll loop — sleep only the remaining interval after each poll.
+   * Unlike setInterval, this ensures consistent spacing regardless of poll duration.
+   */
+  private async runPollLoop(): Promise<void> {
+    while (!this.shouldStop) {
+      const pollStart = Date.now();
+
+      if (!this.isPaused) {
+        try {
+          await this.poll();
+        } catch (err) {
+          console.error('[Poller] Unhandled error:', err);
+        }
+      }
+
+      const elapsed = Date.now() - pollStart;
+      const sleepTime = Math.max(0, this.config.intervalMs - elapsed);
+      if (sleepTime > 0) {
+        await new Promise(resolve => setTimeout(resolve, sleepTime));
+      }
+    }
   }
   
   /**
@@ -127,12 +146,8 @@ export class PositionPoller extends EventEmitter<PollerEvents> {
       console.log('[Poller] Not running');
       return;
     }
-    
-    if (this.intervalId) {
-      clearInterval(this.intervalId);
-      this.intervalId = null;
-    }
-    
+
+    this.shouldStop = true;
     this.isRunning = false;
     this.emit('stop');
     

@@ -49,16 +49,25 @@ export class PositionCache {
    * @returns The position, or undefined if not found
    */
   get(tokenId: string): Position | undefined {
-    return this.cache.get(tokenId); // Safe: objects are frozen
+    const pos = this.cache.get(tokenId);
+    return pos ? { ...pos } : undefined; // Clone — callers may mutate
   }
-  
+
   /**
    * Get all cached positions
-   * 
-   * @returns Array of all positions
+   *
+   * @returns Array of all positions (shallow clones)
    */
   getAll(): Position[] {
-    return Array.from(this.cache.values()); // Safe: objects are frozen
+    return Array.from(this.cache.values()).map(p => ({ ...p }));
+  }
+
+  /**
+   * Get all cached positions without cloning.
+   * Only use when caller guarantees it won't mutate the returned objects.
+   */
+  getAllReadonly(): ReadonlyArray<Readonly<Position>> {
+    return Array.from(this.cache.values());
   }
   
   /**

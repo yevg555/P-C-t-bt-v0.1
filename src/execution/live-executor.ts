@@ -273,9 +273,9 @@ export class LiveTradingExecutor implements OrderExecutor {
       const executedAt = new Date();
       console.log(`[LIVE] Order response:`, JSON.stringify(response, null, 2));
 
-      this.circuitBreaker.recordSuccess();
-
       if (!response || !response.success) {
+        // Record failure BEFORE returning — structured API rejections must count
+        this.circuitBreaker.recordFailure();
         const errorMsg = response?.errorMsg || "Unknown error from CLOB API";
         console.error(`[LIVE] Order rejected: ${errorMsg}`);
         return {
@@ -289,6 +289,8 @@ export class LiveTradingExecutor implements OrderExecutor {
           orderType: order.orderType,
         };
       }
+
+      this.circuitBreaker.recordSuccess();
 
       const clobOrderId = response.orderID || orderId;
       const status = response.status || "live";

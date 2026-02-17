@@ -86,6 +86,29 @@ export interface PerformanceSummary {
   worstTradePnl: number;
 }
 
+export interface AdvancedAnalytics {
+  /** Annualized Sharpe ratio (assuming 365 trading days, risk-free rate = 0) */
+  sharpeRatio: number;
+  /** Maximum drawdown in dollar terms */
+  maxDrawdownDollar: number;
+  /** Maximum drawdown as a percentage (0-1) */
+  maxDrawdownPercent: number;
+  /** Gross profits divided by gross losses (Infinity if no losses) */
+  profitFactor: number;
+  /** Average P&L of winning trades */
+  averageWin: number;
+  /** Average P&L of losing trades (negative number) */
+  averageLoss: number;
+  /** Longest consecutive winning streak */
+  largestWinStreak: number;
+  /** Longest consecutive losing streak */
+  largestLossStreak: number;
+  /** Expectancy per trade: (winRate * avgWin) - (lossRate * avgLoss) */
+  expectancy: number;
+  /** Number of trades included in the analysis */
+  tradeCount: number;
+}
+
 // ============================================
 // TRADE STORE
 // ============================================
@@ -456,6 +479,141 @@ export class TradeStore {
       .get(...params) as { count: number };
 
     return result.count;
+  }
+
+  // ============================================
+  // ADVANCED ANALYTICS
+  // ============================================
+
+  /**
+   * Compute advanced performance analytics from SELL trades with realized P&L.
+   *
+   * Metrics:
+   *   - Sharpe Ratio (annualized, 365 days, risk-free rate = 0)
+   *   - Max Drawdown (dollar and percentage)
+   *   - Profit Factor (gross profits / gross losses)
+   *   - Average Win / Average Loss
+   *   - Largest Win Streak / Loss Streak
+   *   - Expectancy per trade
+   */
+  getAdvancedAnalytics(sessionId?: number): AdvancedAnalytics {
+    const where = sessionId
+      ? "WHERE side = 'SELL' AND pnl IS NOT NULL AND session_id = ?"
+      : "WHERE side = 'SELL' AND pnl IS NOT NULL";
+    const params = sessionId ? [sessionId] : [];
+
+    const rows = this.db
+      .prepare(
+        `SELECT pnl FROM trades ${where} ORDER BY created_at ASC`
+      )
+      .all(...params) as Array<{ pnl: number }>;
+
+    const tradeCount = rows.length;
+
+    // Default / empty result when there are no qualifying trades
+    if (tradeCount === 0) {
+      return {
+        sharpeRatio: 0,
+        maxDrawdownDollar: 0,
+        maxDrawdownPercent: 0,
+        profitFactor: 0,
+        averageWin: 0,
+        averageLoss: 0,
+        largestWinStreak: 0,
+        largestLossStreak: 0,
+        expectancy: 0,
+        tradeCount: 0,
+      };
+    }
+
+    const pnls = rows.map((r) => r.pnl);
+
+    // ----- Win / Loss buckets -----
+    const wins = pnls.filter((p) => p > 0);
+    const losses = pnls.filter((p) => p < 0);
+
+    const grossProfit = wins.reduce((s, p) => s + p, 0);
+    const grossLoss = Math.abs(losses.reduce((s, p) => s + p, 0));
+
+    const averageWin = wins.length > 0 ? grossProfit / wins.length : 0;
+    const averageLoss = losses.length > 0 ? -(grossLoss / losses.length) : 0;
+
+    const winRate = wins.length / tradeCount;
+    const lossRate = losses.length / tradeCount;
+
+    // ----- Profit Factor -----
+    const profitFactor = grossLoss > 0 ? grossProfit / grossLoss : (grossProfit > 0 ? Infinity : 0);
+
+    // ----- Expectancy -----
+    // expectancy = (winRate * avgWin) - (lossRate * |avgLoss|)
+    const expectancy = (winRate * averageWin) - (lossRate * Math.abs(averageLoss));
+
+    // ----- Sharpe Ratio (annualized) -----
+    const meanPnl = pnls.reduce((s, p) => s + p, 0) / tradeCount;
+    let variance = 0;
+    for (const p of pnls) {
+      variance += (p - meanPnl) ** 2;
+    }
+    variance = tradeCount > 1 ? variance / (tradeCount - 1) : 0;
+    const stdDev = Math.sqrt(variance);
+    const sharpeRatio = stdDev > 0 ? (meanPnl / stdDev) * Math.sqrt(365) : 0;
+
+    // ----- Max Drawdown -----
+    let peak = 0;
+    let cumulative = 0;
+    let maxDrawdownDollar = 0;
+    let maxDrawdownPercent = 0;
+
+    for (const p of pnls) {
+      cumulative += p;
+      if (cumulative > peak) {
+        peak = cumulative;
+      }
+      const drawdown = peak - cumulative;
+      if (drawdown > maxDrawdownDollar) {
+        maxDrawdownDollar = drawdown;
+        maxDrawdownPercent = peak > 0 ? drawdown / peak : 0;
+      }
+    }
+
+    // ----- Win / Loss Streaks -----
+    let currentWinStreak = 0;
+    let currentLossStreak = 0;
+    let largestWinStreak = 0;
+    let largestLossStreak = 0;
+
+    for (const p of pnls) {
+      if (p > 0) {
+        currentWinStreak++;
+        currentLossStreak = 0;
+        if (currentWinStreak > largestWinStreak) {
+          largestWinStreak = currentWinStreak;
+        }
+      } else if (p < 0) {
+        currentLossStreak++;
+        currentWinStreak = 0;
+        if (currentLossStreak > largestLossStreak) {
+          largestLossStreak = currentLossStreak;
+        }
+      } else {
+        // p === 0 (breakeven) resets both streaks
+        currentWinStreak = 0;
+        currentLossStreak = 0;
+      }
+    }
+
+    return {
+      sharpeRatio,
+      maxDrawdownDollar,
+      maxDrawdownPercent,
+      profitFactor,
+      averageWin,
+      averageLoss,
+      largestWinStreak,
+      largestLossStreak,
+      expectancy,
+      tradeCount,
+    };
   }
 
   // ============================================

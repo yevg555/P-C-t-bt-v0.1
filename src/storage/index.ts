@@ -4,4 +4,5 @@ export type {
   SessionRecord,
   TradeQuery,
   PerformanceSummary,
+  AdvancedAnalytics,
 } from "./trade-store";

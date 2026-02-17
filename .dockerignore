@@ -1,0 +1,48 @@
+# Dependencies (re-installed inside container)
+node_modules/
+
+# Build output (rebuilt inside container)
+dist/
+
+# Environment variables (mounted at runtime, never baked in)
+.env
+.env.local
+.env.*.local
+
+# Git
+.git/
+.github/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# Test coverage
+coverage/
+
+# Temporary files
+*.tmp
+*.temp
+
+# SQLite databases (persisted via volume mount)
+data/*.db
+data/*.db-journal
+data/*.db-wal
+
+# Documentation
+*.md
+LICENSE
+
+# Docker files themselves
+Dockerfile
+docker-compose.yml

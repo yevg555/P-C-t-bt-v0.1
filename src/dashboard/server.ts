@@ -11,6 +11,7 @@
  *   GET /api/sessions?limit=N - Session history
  *   GET /api/performance      - Aggregate performance summary
  *   GET /api/performance/tokens - P&L grouped by token
+ *   GET /api/analytics         - Advanced analytics (Sharpe, drawdown, etc.)
  *   GET /api/config           - Current bot configuration
  *
  * WebSocket (same port):
@@ -184,6 +185,20 @@ export class DashboardServer {
           : undefined;
         const tokenPnl = store.getPnlByToken(sessionId);
         res.json({ tokens: tokenPnl });
+      } catch (err) {
+        res.status(500).json({ error: String(err) });
+      }
+    });
+
+    // Advanced analytics (Sharpe ratio, drawdown, profit factor, etc.)
+    this.app.get("/api/analytics", (req, res) => {
+      try {
+        const store = this.bot.getTradeStore();
+        const sessionId = req.query.sessionId
+          ? Number(req.query.sessionId)
+          : undefined;
+        const analytics = store.getAdvancedAnalytics(sessionId);
+        res.json(analytics);
       } catch (err) {
         res.status(500).json({ error: String(err) });
       }

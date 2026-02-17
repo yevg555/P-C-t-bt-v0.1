@@ -121,6 +121,8 @@ export function createLiveExecutor(): LiveTradingExecutor {
     apiPassphrase: process.env.CLOB_PASSPHRASE || undefined,
     orderFillTimeoutSeconds: parseInt(process.env.ORDER_FILL_TIMEOUT_SECONDS || "30"),
     orderStatusPollIntervalMs: parseInt(process.env.ORDER_STATUS_POLL_INTERVAL_MS || "1000"),
+    maxSlippageBps: parseInt(process.env.MAX_SLIPPAGE_BPS || "200"),
+    maxRetries: parseInt(process.env.MAX_API_RETRIES || "3"),
   };
 
   return new LiveTradingExecutor(config);

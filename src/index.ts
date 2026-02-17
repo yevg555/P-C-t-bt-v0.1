@@ -43,6 +43,7 @@ import {
 } from "./types";
 import { TradeStore } from "./storage";
 import { DashboardServer } from "./dashboard";
+import { AlertService } from "./alerts";
 
 /**
  * Polling method determines how we detect trader's trades
@@ -101,6 +102,9 @@ class CopyTradingBot {
 
   // Dashboard server
   private dashboard: DashboardServer | null = null;
+
+  // Alert/notification service
+  private alertService: AlertService;
 
   // Tracking state
   private dailyPnL: number = 0;
@@ -239,6 +243,14 @@ class CopyTradingBot {
     const dbPath = process.env.TRADE_DB_PATH || undefined;
     this.tradeStore = new TradeStore(dbPath);
 
+    // Alert/notification service
+    this.alertService = new AlertService({
+      telegramBotToken: process.env.TELEGRAM_BOT_TOKEN,
+      telegramChatId: process.env.TELEGRAM_CHAT_ID,
+      discordWebhookUrl: process.env.DISCORD_WEBHOOK_URL,
+      minSeverity: (process.env.ALERT_MIN_SEVERITY as "critical" | "high" | "medium" | "low") || "high",
+    });
+
     this.setupEventHandlers();
   }
 
@@ -262,10 +274,12 @@ class CopyTradingBot {
         console.log("   Check your internet connection and API status");
         console.log(`   Consecutive errors: ${errorCount}`);
         console.log("");
+        this.alertService.pollerDegraded(errorCount);
       });
 
       this.activityPoller.on("recovered", () => {
         console.log("[BOT] Poller recovered from errors");
+        this.alertService.pollerRecovered();
       });
     } else if (this.positionPoller) {
       // Position-based polling (legacy)
@@ -283,10 +297,12 @@ class CopyTradingBot {
         console.log("   Check your internet connection and API status");
         console.log(`   Consecutive errors: ${errorCount}`);
         console.log("");
+        this.alertService.pollerDegraded(errorCount);
       });
 
       this.positionPoller.on("recovered", () => {
         console.log("[BOT] Poller recovered from errors");
+        this.alertService.pollerRecovered();
       });
     }
 
@@ -447,6 +463,7 @@ class CopyTradingBot {
 
     if (!marketRisk.approved) {
       console.log(`[RISK] MARKET REJECTED: ${marketRisk.reason}`);
+      this.alertService.tradeRejected(`Market: ${marketRisk.reason}`);
       return;
     }
     if (marketRisk.warnings.length > 0) {
@@ -551,6 +568,7 @@ class CopyTradingBot {
 
     if (!riskResult.approved) {
       console.log(`[RISK] REJECTED: ${riskResult.reason}`);
+      this.alertService.tradeRejected(`Risk: ${riskResult.reason}`);
       return;
     }
 
@@ -631,8 +649,14 @@ class CopyTradingBot {
       } catch (dbError) {
         console.warn(`[DB] Failed to persist trade: ${dbError}`);
       }
+
+      // Send alert for filled trades
+      if (result.status === "filled" || result.filledSize > 0) {
+        this.alertService.tradeFilled(order.side, result.filledSize, fillPrice, tradePnl);
+      }
     } catch (error) {
       console.error(`[EXEC] Execution failed: ${error}`);
+      this.alertService.tradeFailed(String(error));
     }
 
     console.log("=".repeat(60));
@@ -713,6 +737,11 @@ class CopyTradingBot {
     // TP/SL is always a SELL — use entry price from the event itself
     const entryPrice = event.entryPrice;
 
+    // Alert for TP/SL trigger
+    this.alertService.tpSlTriggered(
+      event.triggerType, event.tokenId, event.entryPrice, event.currentPrice, event.percentChange
+    );
+
     try {
       const result = await this.executor.execute(event.order);
 
@@ -744,8 +773,13 @@ class CopyTradingBot {
       } catch (dbError) {
         console.warn(`[DB] Failed to persist TP/SL trade: ${dbError}`);
       }
+
+      if (result.status === "filled" || result.filledSize > 0) {
+        this.alertService.tradeFilled("SELL", result.filledSize, fillPrice, tradePnl);
+      }
     } catch (error) {
       console.error(`[TP/SL] Execution failed: ${error}`);
+      this.alertService.tradeFailed(`TP/SL: ${error}`);
     }
 
     console.log("=".repeat(60));
@@ -863,6 +897,7 @@ class CopyTradingBot {
 
     if (!riskResult.approved) {
       console.log(`[RISK] REJECTED: ${riskResult.reason}`);
+      this.alertService.tradeRejected(`Risk: ${riskResult.reason}`);
       return;
     }
 
@@ -918,8 +953,13 @@ class CopyTradingBot {
       } catch (dbError) {
         console.warn(`[DB] Failed to persist trade: ${dbError}`);
       }
+
+      if (result.status === "filled" || result.filledSize > 0) {
+        this.alertService.tradeFilled(order.side, result.filledSize, fillPriceLegacy, tradePnl);
+      }
     } catch (error) {
       console.error(`[EXEC] Execution failed: ${error}`);
+      this.alertService.tradeFailed(String(error));
     }
 
     console.log("=".repeat(60));
@@ -1046,7 +1086,11 @@ class CopyTradingBot {
     } else {
       console.log(`  Dashboard:        DISABLED`);
     }
+    console.log(`  Alerts:           ${this.alertService.getStatus()}`);
     console.log("");
+
+    // Send session started alert
+    this.alertService.sessionStarted(getTradingMode(), startingBalance);
 
     // Run startup tests
     console.log("  --- Startup Tests ---");
@@ -1441,6 +1485,9 @@ class CopyTradingBot {
     } catch {
       // Ignore DB errors during shutdown
     }
+
+    // Send session ended alert (fire-and-forget)
+    this.alertService.sessionEnded(stats.tradeCount, stats.totalPnL).catch(() => {});
 
     this.tradeStore.close();
   }

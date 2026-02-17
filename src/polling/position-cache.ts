@@ -33,12 +33,12 @@ export class PositionCache {
   update(positions: Position[]): void {
     // Clear old data
     this.cache.clear();
-    
-    // Store new positions
+
+    // Store frozen positions — prevents external mutation without cloning on every read
     for (const position of positions) {
-      this.cache.set(position.tokenId, { ...position }); // Clone to avoid mutations
+      this.cache.set(position.tokenId, Object.freeze({ ...position }));
     }
-    
+
     this.lastUpdated = new Date();
   }
   
@@ -49,8 +49,7 @@ export class PositionCache {
    * @returns The position, or undefined if not found
    */
   get(tokenId: string): Position | undefined {
-    const pos = this.cache.get(tokenId);
-    return pos ? { ...pos } : undefined; // Return a clone
+    return this.cache.get(tokenId); // Safe: objects are frozen
   }
   
   /**
@@ -59,7 +58,7 @@ export class PositionCache {
    * @returns Array of all positions
    */
   getAll(): Position[] {
-    return Array.from(this.cache.values()).map(p => ({ ...p })); // Clone all
+    return Array.from(this.cache.values()); // Safe: objects are frozen
   }
   
   /**

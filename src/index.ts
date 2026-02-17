@@ -90,6 +90,7 @@ class CopyTradingBot {
 
   // Portfolio value prefetch interval
   private portfolioValuePrefetchInterval: NodeJS.Timeout | null = null;
+  private isPrefetching = false;
 
   // Watched token IDs for price cache warming (from trader's positions)
   private watchedTokenIds: Set<string> = new Set();
@@ -111,12 +112,14 @@ class CopyTradingBot {
   private totalPnL: number = 0;
   private tradeCount: number = 0;
 
-  // Latency tracking
+  // Latency tracking (ring buffer for O(1) insert)
   private latencySamples: Array<{
     detectionLatencyMs: number;
     executionLatencyMs: number;
     totalLatencyMs: number;
   }> = [];
+  private latencyWriteIndex: number = 0;
+  private latencySampleCount: number = 0;
   private maxLatencySamples: number = 100;
 
   // Clock drift calibration (measured on startup)
@@ -680,9 +683,11 @@ class CopyTradingBot {
    * Record a latency sample for statistics
    */
   private recordLatencySample(detectionLatencyMs: number, executionLatencyMs: number, totalLatencyMs: number): void {
-    this.latencySamples.push({ detectionLatencyMs, executionLatencyMs, totalLatencyMs });
-    if (this.latencySamples.length > this.maxLatencySamples) {
-      this.latencySamples.shift();
+    // Ring buffer: O(1) insert, no shift/splice needed
+    this.latencySamples[this.latencyWriteIndex] = { detectionLatencyMs, executionLatencyMs, totalLatencyMs };
+    this.latencyWriteIndex = (this.latencyWriteIndex + 1) % this.maxLatencySamples;
+    if (this.latencySampleCount < this.maxLatencySamples) {
+      this.latencySampleCount++;
     }
   }
 
@@ -696,7 +701,8 @@ class CopyTradingBot {
     sampleCount: number;
     clockDriftOffset: number;
   } {
-    if (this.latencySamples.length === 0) {
+    const count = this.latencySampleCount;
+    if (count === 0) {
       return {
         avgDetectionMs: 0,
         avgExecutionMs: 0,
@@ -706,10 +712,15 @@ class CopyTradingBot {
       };
     }
 
-    const sumDetection = this.latencySamples.reduce((a, b) => a + b.detectionLatencyMs, 0);
-    const sumExecution = this.latencySamples.reduce((a, b) => a + b.executionLatencyMs, 0);
-    const sumTotal = this.latencySamples.reduce((a, b) => a + b.totalLatencyMs, 0);
-    const count = this.latencySamples.length;
+    let sumDetection = 0;
+    let sumExecution = 0;
+    let sumTotal = 0;
+    for (let i = 0; i < count; i++) {
+      const s = this.latencySamples[i];
+      sumDetection += s.detectionLatencyMs;
+      sumExecution += s.executionLatencyMs;
+      sumTotal += s.totalLatencyMs;
+    }
 
     return {
       avgDetectionMs: Math.round(sumDetection / count),
@@ -1194,10 +1205,14 @@ class CopyTradingBot {
     // Set up periodic prefetch (every 30 seconds to keep cache warm)
     const prefetchIntervalMs = 30000;
     this.portfolioValuePrefetchInterval = setInterval(async () => {
+      if (this.isPrefetching) return; // Prevent overlapping prefetches
+      this.isPrefetching = true;
       try {
         await this.api.prefetchPortfolioValue(traderAddress);
       } catch {
         // Silently ignore prefetch errors
+      } finally {
+        this.isPrefetching = false;
       }
     }, prefetchIntervalMs);
   }
@@ -1289,17 +1304,9 @@ class CopyTradingBot {
     this.tpSlMonitor.startMonitoring(
       async () => executor.getAllPositionDetails!(),
       async (tokenIds: string[]) => {
-        const prices = new Map<string, number>();
-        for (const tokenId of tokenIds) {
-          try {
-            // Get price for monitoring (use BUY side as reference)
-            const price = await this.api.getPrice(tokenId, "SELL");
-            prices.set(tokenId, price);
-          } catch {
-            // Skip if price fetch fails
-          }
-        }
-        return prices;
+        // Fetch all prices in parallel instead of sequentially
+        const requests = tokenIds.map(tokenId => ({ tokenId, side: "SELL" as const }));
+        return this.api.getPricesParallel(requests);
       }
     );
   }
@@ -1350,16 +1357,17 @@ class CopyTradingBot {
       return;
     }
 
-    // Get current prices for all positions
+    // Fetch all prices in parallel instead of sequentially
+    const requests = Array.from(positions.keys()).map(tokenId => ({
+      tokenId,
+      side: "SELL" as const,
+    }));
+    const fetchedPrices = await this.api.getPricesParallel(requests);
+
+    // Build final price map with fallbacks for failed fetches
     const currentPrices = new Map<string, number>();
     for (const [tokenId, position] of positions) {
-      try {
-        const price = await this.api.getPrice(tokenId, "SELL");
-        currentPrices.set(tokenId, price);
-      } catch {
-        // Use avgPrice as fallback
-        currentPrices.set(tokenId, position.avgPrice);
-      }
+      currentPrices.set(tokenId, fetchedPrices.get(tokenId) ?? position.avgPrice);
     }
 
     // Execute sell all

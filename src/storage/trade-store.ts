@@ -121,6 +121,7 @@ export class TradeStore {
   private insertTradeStmt: Database.Statement;
   private insertSessionStmt: Database.Statement;
   private updateSessionStmt: Database.Statement;
+  private updatePnlStmt: Database.Statement;
 
   constructor(dbPath?: string) {
     const resolvedPath = dbPath || path.join(process.cwd(), "data", "trades.db");
@@ -176,6 +177,8 @@ export class TradeStore {
         ending_balance = @endingBalance
       WHERE id = @id
     `);
+
+    this.updatePnlStmt = this.db.prepare("UPDATE trades SET pnl = ? WHERE id = ?");
   }
 
   /**
@@ -211,6 +214,11 @@ export class TradeStore {
       CREATE INDEX IF NOT EXISTS idx_trades_created ON trades(created_at);
       CREATE INDEX IF NOT EXISTS idx_trades_side ON trades(side);
 
+      -- Compound indexes for common query patterns
+      CREATE INDEX IF NOT EXISTS idx_trades_session_created ON trades(session_id, created_at);
+      CREATE INDEX IF NOT EXISTS idx_trades_session_side ON trades(session_id, side);
+      CREATE INDEX IF NOT EXISTS idx_trades_token_side ON trades(token_id, side);
+
       CREATE TABLE IF NOT EXISTS sessions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         started_at TEXT NOT NULL,
@@ -225,6 +233,8 @@ export class TradeStore {
         starting_balance REAL DEFAULT 0,
         ending_balance REAL
       );
+
+      CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
     `);
   }
 
@@ -332,7 +342,7 @@ export class TradeStore {
    * Update the P&L for a trade (typically after a sell completes)
    */
   updateTradePnl(tradeId: number, pnl: number): void {
-    this.db.prepare("UPDATE trades SET pnl = ? WHERE id = ?").run(pnl, tradeId);
+    this.updatePnlStmt.run(pnl, tradeId);
   }
 
   // ============================================
@@ -526,49 +536,48 @@ export class TradeStore {
       };
     }
 
-    const pnls = rows.map((r) => r.pnl);
-
-    // ----- Win / Loss buckets -----
-    const wins = pnls.filter((p) => p > 0);
-    const losses = pnls.filter((p) => p < 0);
-
-    const grossProfit = wins.reduce((s, p) => s + p, 0);
-    const grossLoss = Math.abs(losses.reduce((s, p) => s + p, 0));
-
-    const averageWin = wins.length > 0 ? grossProfit / wins.length : 0;
-    const averageLoss = losses.length > 0 ? -(grossLoss / losses.length) : 0;
-
-    const winRate = wins.length / tradeCount;
-    const lossRate = losses.length / tradeCount;
-
-    // ----- Profit Factor -----
-    const profitFactor = grossLoss > 0 ? grossProfit / grossLoss : (grossProfit > 0 ? Infinity : 0);
-
-    // ----- Expectancy -----
-    // expectancy = (winRate * avgWin) - (lossRate * |avgLoss|)
-    const expectancy = (winRate * averageWin) - (lossRate * Math.abs(averageLoss));
-
-    // ----- Sharpe Ratio (annualized) -----
-    const meanPnl = pnls.reduce((s, p) => s + p, 0) / tradeCount;
-    let variance = 0;
-    for (const p of pnls) {
-      variance += (p - meanPnl) ** 2;
-    }
-    variance = tradeCount > 1 ? variance / (tradeCount - 1) : 0;
-    const stdDev = Math.sqrt(variance);
-    const sharpeRatio = stdDev > 0 ? (meanPnl / stdDev) * Math.sqrt(365) : 0;
-
-    // ----- Max Drawdown -----
+    // Single-pass computation of all metrics to avoid multiple array iterations
+    let sumPnl = 0;
+    let sumSqPnl = 0;
+    let grossProfit = 0;
+    let grossLoss = 0;
+    let winCount = 0;
+    let lossCount = 0;
     let peak = 0;
     let cumulative = 0;
     let maxDrawdownDollar = 0;
     let maxDrawdownPercent = 0;
+    let currentWinStreak = 0;
+    let currentLossStreak = 0;
+    let largestWinStreak = 0;
+    let largestLossStreak = 0;
 
-    for (const p of pnls) {
-      cumulative += p;
-      if (cumulative > peak) {
-        peak = cumulative;
+    for (const row of rows) {
+      const p = row.pnl;
+      sumPnl += p;
+      sumSqPnl += p * p;
+
+      // Win/loss buckets
+      if (p > 0) {
+        grossProfit += p;
+        winCount++;
+        currentWinStreak++;
+        currentLossStreak = 0;
+        if (currentWinStreak > largestWinStreak) largestWinStreak = currentWinStreak;
+      } else if (p < 0) {
+        grossLoss += -p; // Store as positive
+        lossCount++;
+        currentLossStreak++;
+        currentWinStreak = 0;
+        if (currentLossStreak > largestLossStreak) largestLossStreak = currentLossStreak;
+      } else {
+        currentWinStreak = 0;
+        currentLossStreak = 0;
       }
+
+      // Drawdown (cumulative equity curve)
+      cumulative += p;
+      if (cumulative > peak) peak = cumulative;
       const drawdown = peak - cumulative;
       if (drawdown > maxDrawdownDollar) {
         maxDrawdownDollar = drawdown;
@@ -576,31 +585,22 @@ export class TradeStore {
       }
     }
 
-    // ----- Win / Loss Streaks -----
-    let currentWinStreak = 0;
-    let currentLossStreak = 0;
-    let largestWinStreak = 0;
-    let largestLossStreak = 0;
+    // Derived metrics
+    const meanPnl = sumPnl / tradeCount;
+    // Variance via E[X^2] - E[X]^2, with Bessel's correction
+    const variance = tradeCount > 1
+      ? (sumSqPnl - tradeCount * meanPnl * meanPnl) / (tradeCount - 1)
+      : 0;
+    const stdDev = Math.sqrt(Math.max(0, variance));
+    const sharpeRatio = stdDev > 0 ? (meanPnl / stdDev) * Math.sqrt(365) : 0;
 
-    for (const p of pnls) {
-      if (p > 0) {
-        currentWinStreak++;
-        currentLossStreak = 0;
-        if (currentWinStreak > largestWinStreak) {
-          largestWinStreak = currentWinStreak;
-        }
-      } else if (p < 0) {
-        currentLossStreak++;
-        currentWinStreak = 0;
-        if (currentLossStreak > largestLossStreak) {
-          largestLossStreak = currentLossStreak;
-        }
-      } else {
-        // p === 0 (breakeven) resets both streaks
-        currentWinStreak = 0;
-        currentLossStreak = 0;
-      }
-    }
+    const averageWin = winCount > 0 ? grossProfit / winCount : 0;
+    const averageLoss = lossCount > 0 ? -(grossLoss / lossCount) : 0;
+    const winRate = winCount / tradeCount;
+    const lossRate = lossCount / tradeCount;
+
+    const profitFactor = grossLoss > 0 ? grossProfit / grossLoss : (grossProfit > 0 ? Infinity : 0);
+    const expectancy = (winRate * averageWin) - (lossRate * Math.abs(averageLoss));
 
     return {
       sharpeRatio,

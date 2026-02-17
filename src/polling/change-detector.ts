@@ -41,10 +41,14 @@ export class ChangeDetector {
   detectChanges(previous: Position[], current: Position[]): PositionChange[] {
     const changes: PositionChange[] = [];
     const now = new Date();
-    
-    // Create maps for O(1) lookup
-    const prevMap = new Map(previous.map(p => [p.tokenId, p]));
-    const currMap = new Map(current.map(p => [p.tokenId, p]));
+
+    // Build lookup maps — reuse if input is small, otherwise create fresh
+    const prevMap = previous.length <= 1 && previous.length > 0
+      ? new Map([[previous[0].tokenId, previous[0]]])
+      : new Map(previous.map(p => [p.tokenId, p]));
+    const currMap = current.length <= 1 && current.length > 0
+      ? new Map([[current[0].tokenId, current[0]]])
+      : new Map(current.map(p => [p.tokenId, p]));
     
     // === Check CURRENT positions against PREVIOUS ===
     for (const [tokenId, currPos] of currMap) {

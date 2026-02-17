@@ -8,6 +8,14 @@
  * Rate-limits per-channel to avoid flooding.
  */
 
+import { Agent, fetch as undiciFetch } from "undici";
+
+/** Keep-alive dispatcher for alert HTTP connections (~20-50ms savings per request) */
+const alertDispatcher = new Agent({
+  keepAliveTimeout: 30_000,
+  connections: 2,
+});
+
 export type AlertSeverity = "critical" | "high" | "medium" | "low";
 
 export interface AlertConfig {
@@ -147,7 +155,7 @@ export class AlertService {
 
     try {
       const url = `https://api.telegram.org/bot${this.config.telegramBotToken}/sendMessage`;
-      const res = await fetch(url, {
+      const res = await undiciFetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -156,6 +164,7 @@ export class AlertService {
           parse_mode: "HTML",
           disable_notification: false,
         }),
+        dispatcher: alertDispatcher,
       });
       if (!res.ok) {
         console.warn(`[ALERT] Telegram send failed: ${res.status} ${res.statusText}`);
@@ -174,7 +183,7 @@ export class AlertService {
     };
 
     try {
-      const res = await fetch(this.config.discordWebhookUrl!, {
+      const res = await undiciFetch(this.config.discordWebhookUrl!, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -186,6 +195,7 @@ export class AlertService {
             footer: { text: "Copy Trading Bot" },
           }],
         }),
+        dispatcher: alertDispatcher,
       });
       if (!res.ok) {
         console.warn(`[ALERT] Discord send failed: ${res.status} ${res.statusText}`);

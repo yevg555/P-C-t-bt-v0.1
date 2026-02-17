@@ -42,6 +42,7 @@ import {
   MarketAnalysisConfig,
 } from "./types";
 import { TradeStore } from "./storage";
+import { DashboardServer } from "./dashboard";
 
 /**
  * Polling method determines how we detect trader's trades
@@ -97,6 +98,9 @@ class CopyTradingBot {
 
   // Trade history persistence
   private tradeStore: TradeStore;
+
+  // Dashboard server
+  private dashboard: DashboardServer | null = null;
 
   // Tracking state
   private dailyPnL: number = 0;
@@ -619,6 +623,11 @@ class CopyTradingBot {
           executionLatencyMs,
           totalLatencyMs: Math.round(totalLatencyCorrected),
         });
+        this.dashboard?.notifyTrade({
+          side: order.side, size: result.filledSize,
+          price: result.avgFillPrice || order.price, pnl: tradePnl,
+          status: result.status, tokenId: order.tokenId,
+        });
       } catch (dbError) {
         console.warn(`[DB] Failed to persist trade: ${dbError}`);
       }
@@ -726,6 +735,11 @@ class CopyTradingBot {
           result,
           traderAddress: this.traderConfig.address,
           pnl: tradePnl,
+        });
+        this.dashboard?.notifyTrade({
+          side: event.order.side, size: result.filledSize,
+          price: result.avgFillPrice || event.order.price, pnl: tradePnl,
+          status: result.status, tokenId: event.tokenId,
         });
       } catch (dbError) {
         console.warn(`[DB] Failed to persist TP/SL trade: ${dbError}`);
@@ -896,6 +910,11 @@ class CopyTradingBot {
           pnl: tradePnl,
           executionLatencyMs: latencyMs,
         });
+        this.dashboard?.notifyTrade({
+          side: order.side, size: result.filledSize,
+          price: result.avgFillPrice || order.price, pnl: tradePnl,
+          status: result.status, tokenId: order.tokenId,
+        });
       } catch (dbError) {
         console.warn(`[DB] Failed to persist trade: ${dbError}`);
       }
@@ -1016,6 +1035,17 @@ class CopyTradingBot {
       startingBalance,
     });
     console.log(`  Trade History:    ENABLED (session #${sessionId})`);
+
+    // Start dashboard server
+    const dashboardEnabled = process.env.DASHBOARD_ENABLED !== "false";
+    if (dashboardEnabled) {
+      const dashboardPort = parseInt(process.env.DASHBOARD_PORT || "3456", 10);
+      this.dashboard = new DashboardServer(this, dashboardPort);
+      await this.dashboard.start();
+      console.log(`  Dashboard:        http://localhost:${dashboardPort}`);
+    } else {
+      console.log(`  Dashboard:        DISABLED`);
+    }
     console.log("");
 
     // Run startup tests
@@ -1319,6 +1349,12 @@ class CopyTradingBot {
     if (this.marketWebSocket) {
       this.marketWebSocket.stop();
       this.marketWebSocket = null;
+    }
+
+    // Stop dashboard server
+    if (this.dashboard) {
+      this.dashboard.stop();
+      this.dashboard = null;
     }
 
     // Clean up keyboard listener

@@ -363,23 +363,17 @@ class CopyTradingBot {
       curPrice: trade.price,
     };
 
-    // Get our current position in this token (needed for SELL calculations)
-    const yourPosition = await this.executor.getPosition(trade.tokenId);
-
-    // Step 1: Should we copy this trade?
-    const shouldCopy = this.sizeCalculator.shouldCopy(change, yourPosition);
-    if (!shouldCopy.copy) {
-      console.log(`[SKIP] ${shouldCopy.reason}`);
-      return;
-    }
-
     // ================================================
-    // STEP 2: FETCH DATA IN PARALLEL
-    // Order book + balance + portfolio value — all independent
+    // STEP 1: FETCH ALL DATA IN PARALLEL
+    // Order book + balance + portfolio value + position (SELL only)
+    // For BUY trades, position is not needed (shouldCopy always returns true,
+    // calculate() uses balance not position). Skipping saves ~50-100ms.
     // ================================================
     console.log(`[PRICE] Trader's execution price: $${trade.price.toFixed(4)}`);
 
-    const [orderBookResult, balance, traderPortfolioValueResult] = await Promise.all([
+    const isSell = trade.side === "SELL";
+
+    const [orderBookResult, balance, traderPortfolioValueResult, yourPosition] = await Promise.all([
       // Fetch full order book (primary) — gives us spread, depth, everything
       this.api.getOrderBook(trade.tokenId)
         .then(book => ({ book, success: true as const }))
@@ -400,7 +394,16 @@ class CopyTradingBot {
           return undefined;
         }
       })(),
+      // Position: only fetch for SELL (needed for shouldCopy + size calc), skip for BUY
+      isSell ? this.executor.getPosition(trade.tokenId) : Promise.resolve(0),
     ]);
+
+    // STEP 1b: Should we copy this trade?
+    const shouldCopy = this.sizeCalculator.shouldCopy(change, yourPosition);
+    if (!shouldCopy.copy) {
+      console.log(`[SKIP] ${shouldCopy.reason}`);
+      return;
+    }
 
     // ================================================
     // STEP 3: ANALYZE MARKET CONDITIONS
@@ -813,8 +816,10 @@ class CopyTradingBot {
     }
     console.log("=".repeat(60));
 
-    // Get our current position in this token (needed for SELL calculations)
-    const yourPosition = await this.executor.getPosition(change.tokenId);
+    // Get our current position (only needed for SELL — skip API call for BUY)
+    const yourPosition = change.side === "SELL"
+      ? await this.executor.getPosition(change.tokenId)
+      : 0;
 
     // Step 1: Should we copy this trade?
     const shouldCopy = this.sizeCalculator.shouldCopy(change, yourPosition);
@@ -1229,9 +1234,12 @@ class CopyTradingBot {
       this.watchedTokenIds = new Set(tokenIds);
 
       if (tokenIds.length > 0) {
-        // Refresh every 4s (just under the 5s price cache TTL)
+        // Both warmers refresh every 4s (under 5s cache TTL), capped at 10 tokens each
+        // CLOB budget: ~2.5 req/sec (prices) + ~2.5 req/sec (books) = ~5 req/sec out of 15/sec
         this.api.startPriceCacheWarmer(tokenIds, 4000);
-        console.log(`[PREFETCH] Price cache warmer: ${tokenIds.length} tokens from trader's positions`);
+        this.api.startOrderBookWarmer(tokenIds, 4000);
+        console.log(`[PREFETCH] Price cache warmer: up to 10 of ${tokenIds.length} tokens, every 4s`);
+        console.log(`[PREFETCH] Order book warmer: up to 10 of ${tokenIds.length} tokens, every 4s`);
 
         // Start hybrid WebSocket trigger (Tier 3H)
         // WebSocket listens for real-time trade events on the trader's markets
@@ -1394,8 +1402,9 @@ class CopyTradingBot {
       this.portfolioValuePrefetchInterval = null;
     }
 
-    // Stop price cache warmer
+    // Stop price cache warmer and order book warmer
     this.api.stopPriceCacheWarmer();
+    this.api.stopOrderBookWarmer();
 
     // Stop WebSocket trigger
     if (this.marketWebSocket) {

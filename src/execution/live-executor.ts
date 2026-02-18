@@ -89,6 +89,12 @@ export class LiveTradingExecutor implements OrderExecutor {
   // Robustness: circuit breaker for API calls
   private circuitBreaker: CircuitBreaker = new CircuitBreaker(5, 30_000);
 
+  // Balance cache: avoids ~50-100ms API call on every trade
+  // Invalidated after each trade execution
+  private cachedBalance: number | null = null;
+  private cachedBalanceTimestamp: number = 0;
+  private balanceCacheTtlMs: number = 10_000; // 10s TTL
+
   constructor(config: LiveExecutorConfig) {
     this.config = config;
   }
@@ -481,6 +487,9 @@ export class LiveTradingExecutor implements OrderExecutor {
    * Track position locally after a fill (for TP/SL + 1-Click Sell + risk)
    */
   private trackPosition(order: OrderSpec, filledSize: number, fillPrice: number): void {
+    // Invalidate balance cache — balance changed due to fill
+    this.cachedBalance = null;
+
     const cost = filledSize * fillPrice;
 
     if (order.side === "BUY") {
@@ -548,16 +557,34 @@ export class LiveTradingExecutor implements OrderExecutor {
 
   /**
    * Get current USDC balance
+   * Uses caching (10s TTL) to avoid ~50-100ms API call on every trade.
+   * Cache is invalidated after each trade execution.
    */
   async getBalance(): Promise<number> {
+    // Check cache first
+    if (this.cachedBalance !== null && Date.now() - this.cachedBalanceTimestamp < this.balanceCacheTtlMs) {
+      return this.cachedBalance;
+    }
+
     this.ensureInitialized();
 
     try {
       const balanceAllowance = await this.client!.getBalanceAllowance({
         asset_type: AssetType.COLLATERAL,
       });
-      return parseFloat(balanceAllowance.balance) / 1e6;
+      const balance = parseFloat(balanceAllowance.balance) / 1e6;
+
+      // Cache the result
+      this.cachedBalance = balance;
+      this.cachedBalanceTimestamp = Date.now();
+
+      return balance;
     } catch (error) {
+      // Return cached value as fallback if available
+      if (this.cachedBalance !== null) {
+        console.warn(`[LIVE] getBalance failed, using cached value: $${this.cachedBalance.toFixed(2)}`);
+        return this.cachedBalance;
+      }
       console.error(`[LIVE] getBalance failed: ${error instanceof Error ? error.message : String(error)}`);
       throw error;
     }

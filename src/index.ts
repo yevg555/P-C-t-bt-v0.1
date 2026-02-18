@@ -1234,12 +1234,12 @@ class CopyTradingBot {
       this.watchedTokenIds = new Set(tokenIds);
 
       if (tokenIds.length > 0) {
-        // Refresh every 4s (just under the 5s price cache TTL)
+        // Both warmers refresh every 4s (under 5s cache TTL), capped at 10 tokens each
+        // CLOB budget: ~2.5 req/sec (prices) + ~2.5 req/sec (books) = ~5 req/sec out of 15/sec
         this.api.startPriceCacheWarmer(tokenIds, 4000);
-        // Refresh order books every 2.5s (under 3s cache TTL) — eliminates ~50-100ms on critical path
-        this.api.startOrderBookWarmer(tokenIds, 2500);
-        console.log(`[PREFETCH] Price cache warmer: ${tokenIds.length} tokens from trader's positions`);
-        console.log(`[PREFETCH] Order book warmer: up to 10 tokens from trader's positions`);
+        this.api.startOrderBookWarmer(tokenIds, 4000);
+        console.log(`[PREFETCH] Price cache warmer: up to 10 of ${tokenIds.length} tokens, every 4s`);
+        console.log(`[PREFETCH] Order book warmer: up to 10 of ${tokenIds.length} tokens, every 4s`);
 
         // Start hybrid WebSocket trigger (Tier 3H)
         // WebSocket listens for real-time trade events on the trader's markets

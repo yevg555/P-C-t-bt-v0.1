@@ -168,6 +168,14 @@ export class PolymarketAPI {
   // /activity: 1000 calls/10s = 100/sec = 10ms between requests
   // /positions: 200 calls/10s = 20/sec = 50ms between requests
   // CLOB API: ~150 calls/10s = 15/sec = 67ms between requests
+  //
+  // CLOB budget breakdown (steady state, 10 watched tokens):
+  //   Price warmer:      10 tokens / 4s = ~2.5 req/sec
+  //   Order book warmer: 10 tokens / 4s = ~2.5 req/sec
+  //   TP/SL monitor:     ~10 tokens / 5s = ~2.0 req/sec (if enabled, SELL side)
+  //   ───────────────────────────────────────────────────
+  //   Background total:  ~7 req/sec
+  //   Remaining for execution: ~8 req/sec
   private lastActivityRequestTime = 0;
   private minActivityRequestInterval = 10; // 100 req/sec for /activity
 
@@ -189,8 +197,8 @@ export class PolymarketAPI {
 
   // Order book cache: tokenId -> cached order book
   private orderBookCache: Map<string, CachedOrderBook> = new Map();
-  // Order book cache TTL in milliseconds (default 3 seconds)
-  private orderBookCacheTtlMs: number = 3000;
+  // Order book cache TTL in milliseconds (5 seconds, matches price cache)
+  private orderBookCacheTtlMs: number = 5000;
 
   // ===================================
   // POSITIONS (Data API)
@@ -618,8 +626,9 @@ export class PolymarketAPI {
 
   /**
    * Start warming the price cache for a set of token IDs.
-   * Runs a background loop that refreshes CLOB prices for all watched tokens,
+   * Runs a background loop that refreshes CLOB prices for watched tokens,
    * so when a trade is detected the price is already cached (~0ms instead of ~60-100ms).
+   * Caps at 10 tokens to limit CLOB rate limit usage (~2.5 req/sec at 4s interval).
    *
    * @param tokenIds - Token IDs to keep warm (typically from trader's current positions)
    * @param intervalMs - How often to refresh (default: 4000ms, just under 5s cache TTL)
@@ -667,11 +676,13 @@ export class PolymarketAPI {
   }
 
   /**
-   * Refresh prices for all watched tokens in parallel.
+   * Refresh prices for watched tokens.
    * Fetches BUY side (ASK) prices — the most common need for copy trading.
+   * Caps at 10 tokens to limit CLOB rate limit usage.
    */
   private async warmPriceCache(): Promise<void> {
-    const requests = Array.from(this.watchedTokenIds).map(tokenId => ({
+    const tokens = Array.from(this.watchedTokenIds).slice(0, 10);
+    const requests = tokens.map(tokenId => ({
       tokenId,
       side: "BUY" as const,
     }));
@@ -689,10 +700,12 @@ export class PolymarketAPI {
    * Keeps order books hot so trade execution skips the ~50-100ms fetch.
    * Caps at 10 tokens to avoid excessive CLOB rate limit pressure.
    *
+   * CLOB budget: 10 books × 67ms = ~670ms per cycle, at 4s interval = ~2.5 req/sec
+   *
    * @param tokenIds - Token IDs to keep warm
-   * @param intervalMs - How often to refresh (default: 2500ms, under 3s cache TTL)
+   * @param intervalMs - How often to refresh (default: 4000ms, under 5s cache TTL)
    */
-  startOrderBookWarmer(tokenIds: string[], intervalMs: number = 2500): void {
+  startOrderBookWarmer(tokenIds: string[], intervalMs: number = 4000): void {
     // Ensure watched set is up to date (shared with price warmer)
     for (const id of tokenIds) {
       this.watchedTokenIds.add(id);
@@ -728,7 +741,7 @@ export class PolymarketAPI {
 
   /**
    * Refresh order books for watched tokens.
-   * Caps at 10 tokens to limit CLOB rate limit usage (~670ms for 10 books).
+   * Caps at 10 tokens to limit CLOB rate limit usage (~2.5 req/sec at 4s interval).
    */
   private async warmOrderBookCache(): Promise<void> {
     const tokens = Array.from(this.watchedTokenIds).slice(0, 10);

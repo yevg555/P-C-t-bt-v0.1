@@ -82,6 +82,14 @@ interface CachedPrice {
 }
 
 /**
+ * Cached order book with timestamp
+ */
+interface CachedOrderBook {
+  book: { bids: Array<{ price: string; size: string }>; asks: Array<{ price: string; size: string }> };
+  timestamp: number;
+}
+
+/**
  * Raw trade/activity response from the API
  * Based on actual Polymarket /activity endpoint response
  */
@@ -178,6 +186,11 @@ export class PolymarketAPI {
   private priceCache: Map<string, CachedPrice> = new Map();
   // Price cache TTL in milliseconds (default 5 seconds - prices change frequently)
   private priceCacheTtlMs: number = 5000;
+
+  // Order book cache: tokenId -> cached order book
+  private orderBookCache: Map<string, CachedOrderBook> = new Map();
+  // Order book cache TTL in milliseconds (default 3 seconds)
+  private orderBookCacheTtlMs: number = 3000;
 
   // ===================================
   // POSITIONS (Data API)
@@ -665,6 +678,69 @@ export class PolymarketAPI {
     await this.getPricesParallel(requests);
   }
 
+  // ===================================
+  // ORDER BOOK CACHE WARMER
+  // ===================================
+
+  private orderBookWarmerInterval: NodeJS.Timeout | null = null;
+
+  /**
+   * Start warming the order book cache for a set of token IDs.
+   * Keeps order books hot so trade execution skips the ~50-100ms fetch.
+   * Caps at 10 tokens to avoid excessive CLOB rate limit pressure.
+   *
+   * @param tokenIds - Token IDs to keep warm
+   * @param intervalMs - How often to refresh (default: 2500ms, under 3s cache TTL)
+   */
+  startOrderBookWarmer(tokenIds: string[], intervalMs: number = 2500): void {
+    // Ensure watched set is up to date (shared with price warmer)
+    for (const id of tokenIds) {
+      this.watchedTokenIds.add(id);
+    }
+
+    // Stop existing warmer if running
+    this.stopOrderBookWarmer();
+
+    if (this.watchedTokenIds.size === 0) {
+      return;
+    }
+
+    console.log(`[API] Order book cache warmer started: up to 10 of ${this.watchedTokenIds.size} tokens, refreshing every ${intervalMs}ms`);
+
+    // Initial warm-up
+    this.warmOrderBookCache();
+
+    // Periodic refresh
+    this.orderBookWarmerInterval = setInterval(() => {
+      this.warmOrderBookCache();
+    }, intervalMs);
+  }
+
+  /**
+   * Stop the order book cache warmer
+   */
+  stopOrderBookWarmer(): void {
+    if (this.orderBookWarmerInterval) {
+      clearInterval(this.orderBookWarmerInterval);
+      this.orderBookWarmerInterval = null;
+    }
+  }
+
+  /**
+   * Refresh order books for watched tokens.
+   * Caps at 10 tokens to limit CLOB rate limit usage (~670ms for 10 books).
+   */
+  private async warmOrderBookCache(): Promise<void> {
+    const tokens = Array.from(this.watchedTokenIds).slice(0, 10);
+    for (const tokenId of tokens) {
+      try {
+        await this.getOrderBook(tokenId);
+      } catch {
+        // Silently ignore warm-up errors
+      }
+    }
+  }
+
   /**
    * Get both execution prices at once
    *
@@ -756,11 +832,18 @@ export class PolymarketAPI {
 
   /**
    * Get order book for a token
+   * Uses caching to reduce API calls (3s TTL by default)
    */
   async getOrderBook(tokenId: string): Promise<{
     bids: Array<{ price: string; size: string }>;
     asks: Array<{ price: string; size: string }>;
   }> {
+    // Check cache first
+    const cached = this.orderBookCache.get(tokenId);
+    if (cached && Date.now() - cached.timestamp < this.orderBookCacheTtlMs) {
+      return cached.book;
+    }
+
     await this.respectClobRateLimit();
 
     const url = `${this.clobApiUrl}/book?token_id=${tokenId}`;
@@ -776,10 +859,27 @@ export class PolymarketAPI {
 
     const data = (await response.json()) as OrderBookResponse;
 
-    return {
+    const book = {
       bids: data.bids || [],
       asks: data.asks || [],
     };
+
+    // Cache the result
+    this.orderBookCache.set(tokenId, { book, timestamp: Date.now() });
+
+    return book;
+  }
+
+  /**
+   * Get cached order book (if available and fresh)
+   * Returns undefined if not cached or stale
+   */
+  getCachedOrderBook(tokenId: string): { bids: Array<{ price: string; size: string }>; asks: Array<{ price: string; size: string }> } | undefined {
+    const cached = this.orderBookCache.get(tokenId);
+    if (cached && Date.now() - cached.timestamp < this.orderBookCacheTtlMs) {
+      return cached.book;
+    }
+    return undefined;
   }
 
   // ===================================

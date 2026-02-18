@@ -119,6 +119,7 @@ export function createLiveExecutor(): LiveTradingExecutor {
     apiKey: process.env.CLOB_API_KEY || undefined,
     apiSecret: process.env.CLOB_SECRET || undefined,
     apiPassphrase: process.env.CLOB_PASSPHRASE || undefined,
+    gtcFillTimeoutSeconds: process.env.GTC_FILL_TIMEOUT_SECONDS ? parseInt(process.env.GTC_FILL_TIMEOUT_SECONDS) : undefined,
     orderStatusPollIntervalMs: parseInt(process.env.ORDER_STATUS_POLL_INTERVAL_MS || "1000"),
     maxSlippageBps: parseInt(process.env.MAX_SLIPPAGE_BPS || "200"),
     maxRetries: parseInt(process.env.MAX_API_RETRIES || "3"),

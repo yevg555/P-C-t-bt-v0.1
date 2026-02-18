@@ -13,10 +13,10 @@
  *   So to execute a BUY order, we need the ASK → call with side=SELL
  *   And to execute a SELL order, we need the BID → call with side=BUY
  *
- * Rate Limits (per 10 seconds):
- *   - /activity endpoint: 1000 calls (100/sec) - 5x higher!
- *   - /positions endpoint: 200 calls (20/sec)
- *   - CLOB API: ~150 calls (15/sec)
+ * Rate Limits (per 10 seconds, from docs.polymarket.com):
+ *   - /activity endpoint: 100 calls (10/sec)
+ *   - /positions endpoint: 150 calls (15/sec)
+ *   - CLOB /price & /book: 1,500 calls each (150/sec)
  */
 
 import { Agent, fetch as undiciFetch } from "undici";
@@ -165,25 +165,36 @@ export class PolymarketAPI {
   }
 
   // Differentiated rate limiting per endpoint type
-  // /activity: 1000 calls/10s = 100/sec = 10ms between requests
-  // /positions: 200 calls/10s = 20/sec = 50ms between requests
-  // CLOB API: ~150 calls/10s = 15/sec = 67ms between requests
+  // (from docs.polymarket.com/quickstart/introduction/rate-limits)
   //
-  // CLOB budget breakdown (steady state, 10 watched tokens):
+  // Data API:
+  //   /activity:  100 calls/10s  = 10/sec  → 100ms between requests
+  //   /positions: 150 calls/10s  = 15/sec  → 67ms between requests
+  //   /trades:    200 calls/10s  = 20/sec
+  //
+  // CLOB API:
+  //   /price:  1,500 calls/10s = 150/sec → 7ms between requests
+  //   /book:   1,500 calls/10s = 150/sec → 7ms between requests
+  //   /prices: 500 calls/10s   = 50/sec
+  //   /books:  500 calls/10s   = 50/sec
+  //   POST /order: 3,500/10s burst, 36,000/10min sustained
+  //
+  // Activity budget (10/sec):
+  //   Polling at 200ms = 5 req/sec → 50% of budget
+  //
+  // CLOB budget (150/sec per endpoint, effectively unlimited for our use):
   //   Price warmer:      10 tokens / 4s = ~2.5 req/sec
   //   Order book warmer: 10 tokens / 4s = ~2.5 req/sec
-  //   TP/SL monitor:     ~10 tokens / 5s = ~2.0 req/sec (if enabled, SELL side)
-  //   ───────────────────────────────────────────────────
-  //   Background total:  ~7 req/sec
-  //   Remaining for execution: ~8 req/sec
+  //   TP/SL monitor:     ~10 tokens / 5s = ~2.0 req/sec
+  //   Background total:  ~7 req/sec out of 150/sec → ~5% usage
   private lastActivityRequestTime = 0;
-  private minActivityRequestInterval = 10; // 100 req/sec for /activity
+  private minActivityRequestInterval = 100; // 10 req/sec for /activity
 
   private lastPositionsRequestTime = 0;
-  private minPositionsRequestInterval = 50; // 20 req/sec for /positions
+  private minPositionsRequestInterval = 67; // 15 req/sec for /positions
 
   private lastClobRequestTime = 0;
-  private minClobRequestInterval = 67; // 15 req/sec for CLOB API
+  private minClobRequestInterval = 7; // 150 req/sec for CLOB /price & /book
 
   // Portfolio value cache: address -> cached value
   private portfolioValueCache: Map<string, CachedPortfolioValue> = new Map();
@@ -700,7 +711,7 @@ export class PolymarketAPI {
    * Keeps order books hot so trade execution skips the ~50-100ms fetch.
    * Caps at 10 tokens to avoid excessive CLOB rate limit pressure.
    *
-   * CLOB budget: 10 books × 67ms = ~670ms per cycle, at 4s interval = ~2.5 req/sec
+   * CLOB budget: 10 books × 7ms = ~70ms per cycle, at 4s interval = ~2.5 req/sec
    *
    * @param tokenIds - Token IDs to keep warm
    * @param intervalMs - How often to refresh (default: 4000ms, under 5s cache TTL)

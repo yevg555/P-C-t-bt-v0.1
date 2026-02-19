@@ -1241,6 +1241,14 @@ class CopyTradingBot {
         console.log(`[PREFETCH] Price cache warmer: up to 10 of ${tokenIds.length} tokens, every 4s`);
         console.log(`[PREFETCH] Order book warmer: up to 10 of ${tokenIds.length} tokens, every 4s`);
 
+        // After initial warm-up, log how many tokens were dead (resolved markets)
+        setTimeout(() => {
+          const deadCount = this.api.getDeadTokenCount();
+          if (deadCount > 0) {
+            console.log(`[PREFETCH] Skipping ${deadCount} resolved markets (no orderbook), ${tokenIds.length - deadCount} active`);
+          }
+        }, 5000);
+
         // Start hybrid WebSocket trigger (Tier 3H)
         // WebSocket listens for real-time trade events on the trader's markets
         // and triggers an immediate poll instead of waiting for the next interval

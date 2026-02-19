@@ -211,6 +211,9 @@ export class PolymarketAPI {
   // Order book cache TTL in milliseconds (5 seconds, matches price cache)
   private orderBookCacheTtlMs: number = 5000;
 
+  // Tokens whose markets have resolved (no orderbook) — skip them to avoid 404 spam
+  private deadTokenIds: Set<string> = new Set();
+
   // ===================================
   // POSITIONS (Data API)
   // ===================================
@@ -522,6 +525,11 @@ export class PolymarketAPI {
     const { skipCache = false } = options;
     const cacheKey = `${tokenId}:${tradeIntent}`;
 
+    // Skip tokens from resolved markets (no orderbook)
+    if (this.deadTokenIds.has(tokenId)) {
+      throw new Error(`Token ${tokenId.slice(0, 10)}... has no orderbook (resolved market)`);
+    }
+
     // Check cache first
     if (!skipCache) {
       const cached = this.priceCache.get(cacheKey);
@@ -546,6 +554,12 @@ export class PolymarketAPI {
       });
 
       if (!response.ok) {
+        // 404 = no orderbook (resolved/expired market) — mark as dead, don't spam logs
+        if (response.status === 404) {
+          this.deadTokenIds.add(tokenId);
+          this.watchedTokenIds.delete(tokenId);
+          throw new Error(`No orderbook for ${tokenId.slice(0, 10)}... (resolved market)`);
+        }
         console.error(`[API] Price endpoint returned: ${response.status}`);
         throw new Error(`Price API error: ${response.status}`);
       }
@@ -567,7 +581,10 @@ export class PolymarketAPI {
 
       return price;
     } catch (error) {
-      console.error(`[API] getPrice failed: ${error}`);
+      // Don't log dead token errors (already handled above)
+      if (!(error instanceof Error && error.message.includes("resolved market"))) {
+        console.error(`[API] getPrice failed: ${error}`);
+      }
 
       // Return cached value as fallback (even if stale)
       const cached = this.priceCache.get(cacheKey);
@@ -687,12 +704,29 @@ export class PolymarketAPI {
   }
 
   /**
+   * Get the number of dead tokens (resolved markets with no orderbook)
+   */
+  getDeadTokenCount(): number {
+    return this.deadTokenIds.size;
+  }
+
+  /**
+   * Check if a token is dead (resolved market with no orderbook)
+   */
+  isDeadToken(tokenId: string): boolean {
+    return this.deadTokenIds.has(tokenId);
+  }
+
+  /**
    * Refresh prices for watched tokens.
    * Fetches BUY side (ASK) prices — the most common need for copy trading.
    * Caps at 10 tokens to limit CLOB rate limit usage.
+   * Automatically skips dead tokens (resolved markets with no orderbook).
    */
   private async warmPriceCache(): Promise<void> {
-    const tokens = Array.from(this.watchedTokenIds).slice(0, 10);
+    const tokens = Array.from(this.watchedTokenIds)
+      .filter(id => !this.deadTokenIds.has(id))
+      .slice(0, 10);
     const requests = tokens.map(tokenId => ({
       tokenId,
       side: "BUY" as const,
@@ -753,14 +787,17 @@ export class PolymarketAPI {
   /**
    * Refresh order books for watched tokens.
    * Caps at 10 tokens to limit CLOB rate limit usage (~2.5 req/sec at 4s interval).
+   * Automatically skips dead tokens (resolved markets with no orderbook).
    */
   private async warmOrderBookCache(): Promise<void> {
-    const tokens = Array.from(this.watchedTokenIds).slice(0, 10);
+    const tokens = Array.from(this.watchedTokenIds)
+      .filter(id => !this.deadTokenIds.has(id))
+      .slice(0, 10);
     for (const tokenId of tokens) {
       try {
         await this.getOrderBook(tokenId);
       } catch {
-        // Silently ignore warm-up errors
+        // Silently ignore warm-up errors (dead tokens already tracked)
       }
     }
   }
@@ -794,6 +831,10 @@ export class PolymarketAPI {
    * Use this if you want the raw API behavior
    */
   async getRawPrice(tokenId: string, side: "BUY" | "SELL"): Promise<number> {
+    if (this.deadTokenIds.has(tokenId)) {
+      throw new Error(`No orderbook for ${tokenId.slice(0, 10)}... (resolved market)`);
+    }
+
     await this.respectClobRateLimit();
 
     const url = `${this.clobApiUrl}/price?token_id=${tokenId}&side=${side}`;
@@ -804,6 +845,11 @@ export class PolymarketAPI {
     });
 
     if (!response.ok) {
+      if (response.status === 404) {
+        this.deadTokenIds.add(tokenId);
+        this.watchedTokenIds.delete(tokenId);
+        throw new Error(`No orderbook for ${tokenId.slice(0, 10)}... (resolved market)`);
+      }
       throw new Error(`Price API error: ${response.status}`);
     }
 
@@ -816,6 +862,10 @@ export class PolymarketAPI {
    * Good for estimation, NOT for execution
    */
   async getMidpoint(tokenId: string): Promise<number> {
+    if (this.deadTokenIds.has(tokenId)) {
+      throw new Error(`No orderbook for ${tokenId.slice(0, 10)}... (resolved market)`);
+    }
+
     await this.respectClobRateLimit();
 
     const url = `${this.clobApiUrl}/midpoint?token_id=${tokenId}`;
@@ -826,6 +876,11 @@ export class PolymarketAPI {
     });
 
     if (!response.ok) {
+      if (response.status === 404) {
+        this.deadTokenIds.add(tokenId);
+        this.watchedTokenIds.delete(tokenId);
+        throw new Error(`No orderbook for ${tokenId.slice(0, 10)}... (resolved market)`);
+      }
       throw new Error(`Midpoint API error: ${response.status}`);
     }
 
@@ -837,6 +892,10 @@ export class PolymarketAPI {
    * Get spread directly from API
    */
   async getSpread(tokenId: string): Promise<number> {
+    if (this.deadTokenIds.has(tokenId)) {
+      throw new Error(`No orderbook for ${tokenId.slice(0, 10)}... (resolved market)`);
+    }
+
     await this.respectClobRateLimit();
 
     const url = `${this.clobApiUrl}/spread?token_id=${tokenId}`;
@@ -847,6 +906,11 @@ export class PolymarketAPI {
     });
 
     if (!response.ok) {
+      if (response.status === 404) {
+        this.deadTokenIds.add(tokenId);
+        this.watchedTokenIds.delete(tokenId);
+        throw new Error(`No orderbook for ${tokenId.slice(0, 10)}... (resolved market)`);
+      }
       throw new Error(`Spread API error: ${response.status}`);
     }
 
@@ -862,6 +926,11 @@ export class PolymarketAPI {
     bids: Array<{ price: string; size: string }>;
     asks: Array<{ price: string; size: string }>;
   }> {
+    // Skip tokens from resolved markets (no orderbook)
+    if (this.deadTokenIds.has(tokenId)) {
+      throw new Error(`No orderbook for ${tokenId.slice(0, 10)}... (resolved market)`);
+    }
+
     // Check cache first
     const cached = this.orderBookCache.get(tokenId);
     if (cached && Date.now() - cached.timestamp < this.orderBookCacheTtlMs) {
@@ -878,6 +947,11 @@ export class PolymarketAPI {
     });
 
     if (!response.ok) {
+      if (response.status === 404) {
+        this.deadTokenIds.add(tokenId);
+        this.watchedTokenIds.delete(tokenId);
+        throw new Error(`No orderbook for ${tokenId.slice(0, 10)}... (resolved market)`);
+      }
       throw new Error(`OrderBook API error: ${response.status}`);
     }
 

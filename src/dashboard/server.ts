@@ -42,6 +42,16 @@ export interface DashboardBotInterface {
       avgDetectionMs: number;
       avgExecutionMs: number;
       avgTotalMs: number;
+      avgProcessingMs: number;
+      avgOrderMs: number;
+      avgPollNetworkMs: number;
+      avgApiIndexingDelayMs: number;
+      minTotalMs: number;
+      maxTotalMs: number;
+      p50TotalMs: number;
+      p95TotalMs: number;
+      minDetectionMs: number;
+      maxDetectionMs: number;
       sampleCount: number;
       clockDriftOffset: number;
     };

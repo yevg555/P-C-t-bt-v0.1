@@ -42,6 +42,8 @@ export interface TradeRecord {
   detectionLatencyMs?: number;
   executionLatencyMs?: number;
   totalLatencyMs?: number;
+  processingLatencyMs?: number;
+  orderLatencyMs?: number;
   traderAddress?: string;
   traderPrice?: number;
   createdAt: string;
@@ -82,6 +84,10 @@ export interface PerformanceSummary {
   winRate: number;
   avgTradeSize: number;
   avgLatencyMs: number;
+  minLatencyMs: number;
+  maxLatencyMs: number;
+  avgProcessingLatencyMs: number;
+  avgOrderLatencyMs: number;
   bestTradePnl: number;
   worstTradePnl: number;
 }
@@ -138,6 +144,7 @@ export class TradeStore {
     this.db.pragma("journal_mode = WAL");
 
     this.createTables();
+    this.migrateSchema();
 
     // Prepare statements
     this.insertTradeStmt = this.db.prepare(`
@@ -146,12 +153,14 @@ export class TradeStore {
         side, size, price, cost, status,
         execution_mode, order_type, pnl,
         detection_latency_ms, execution_latency_ms, total_latency_ms,
+        processing_latency_ms, order_latency_ms,
         trader_address, trader_price, created_at
       ) VALUES (
         @orderId, @sessionId, @tokenId, @marketId, @marketTitle,
         @side, @size, @price, @cost, @status,
         @executionMode, @orderType, @pnl,
         @detectionLatencyMs, @executionLatencyMs, @totalLatencyMs,
+        @processingLatencyMs, @orderLatencyMs,
         @traderAddress, @traderPrice, @createdAt
       )
     `);
@@ -204,6 +213,8 @@ export class TradeStore {
         detection_latency_ms INTEGER,
         execution_latency_ms INTEGER,
         total_latency_ms INTEGER,
+        processing_latency_ms INTEGER,
+        order_latency_ms INTEGER,
         trader_address TEXT,
         trader_price REAL,
         created_at TEXT NOT NULL
@@ -236,6 +247,23 @@ export class TradeStore {
 
       CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
     `);
+  }
+
+  /**
+   * Add columns that may be missing in older databases
+   */
+  private migrateSchema(): void {
+    const columns = this.db
+      .prepare("PRAGMA table_info(trades)")
+      .all() as Array<{ name: string }>;
+    const columnNames = new Set(columns.map(c => c.name));
+
+    if (!columnNames.has("processing_latency_ms")) {
+      this.db.exec("ALTER TABLE trades ADD COLUMN processing_latency_ms INTEGER");
+    }
+    if (!columnNames.has("order_latency_ms")) {
+      this.db.exec("ALTER TABLE trades ADD COLUMN order_latency_ms INTEGER");
+    }
   }
 
   // ============================================
@@ -309,6 +337,8 @@ export class TradeStore {
     detectionLatencyMs?: number;
     executionLatencyMs?: number;
     totalLatencyMs?: number;
+    processingLatencyMs?: number;
+    orderLatencyMs?: number;
   }): number {
     const { order, result } = params;
     const cost = result.filledSize * (result.avgFillPrice || order.price);
@@ -330,6 +360,8 @@ export class TradeStore {
       detectionLatencyMs: params.detectionLatencyMs || null,
       executionLatencyMs: params.executionLatencyMs || null,
       totalLatencyMs: params.totalLatencyMs || null,
+      processingLatencyMs: params.processingLatencyMs || null,
+      orderLatencyMs: params.orderLatencyMs || null,
       traderAddress: params.traderAddress || null,
       traderPrice: params.traderPrice || null,
       createdAt: result.executedAt.toISOString(),
@@ -429,6 +461,10 @@ export class TradeStore {
           SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END) as loss_count,
           AVG(size) as avg_trade_size,
           AVG(total_latency_ms) as avg_latency_ms,
+          MIN(total_latency_ms) as min_latency_ms,
+          MAX(total_latency_ms) as max_latency_ms,
+          AVG(processing_latency_ms) as avg_processing_latency_ms,
+          AVG(order_latency_ms) as avg_order_latency_ms,
           MAX(pnl) as best_trade_pnl,
           MIN(pnl) as worst_trade_pnl
         FROM trades ${where}`
@@ -451,6 +487,10 @@ export class TradeStore {
       winRate: sellCount > 0 ? winCount / sellCount : 0,
       avgTradeSize: (stats.avg_trade_size as number) || 0,
       avgLatencyMs: (stats.avg_latency_ms as number) || 0,
+      minLatencyMs: (stats.min_latency_ms as number) || 0,
+      maxLatencyMs: (stats.max_latency_ms as number) || 0,
+      avgProcessingLatencyMs: (stats.avg_processing_latency_ms as number) || 0,
+      avgOrderLatencyMs: (stats.avg_order_latency_ms as number) || 0,
       bestTradePnl: (stats.best_trade_pnl as number) || 0,
       worstTradePnl: (stats.worst_trade_pnl as number) || 0,
     };
@@ -650,6 +690,8 @@ export class TradeStore {
       detectionLatencyMs: row.detection_latency_ms as number | undefined,
       executionLatencyMs: row.execution_latency_ms as number | undefined,
       totalLatencyMs: row.total_latency_ms as number | undefined,
+      processingLatencyMs: row.processing_latency_ms as number | undefined,
+      orderLatencyMs: row.order_latency_ms as number | undefined,
       traderAddress: row.trader_address as string | undefined,
       traderPrice: row.trader_price as number | undefined,
       createdAt: row.created_at as string,

@@ -441,9 +441,12 @@
       const lat = stats.latencyStats || {};
       if (lat.sampleCount > 0) {
         setText("latencyValue", lat.avgTotalMs + "ms");
-        setText("latencySub",
-          "Det: " + lat.avgDetectionMs + "ms | Exec: " + lat.avgExecutionMs + "ms"
-        );
+        const parts = [
+          "Det: " + lat.avgDetectionMs + "ms",
+          "Proc: " + (lat.avgProcessingMs || 0) + "ms",
+          "Order: " + (lat.avgOrderMs || 0) + "ms",
+        ];
+        setText("latencySub", parts.join(" | "));
       }
     }
 

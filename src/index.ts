@@ -57,6 +57,27 @@ import { AlertService } from "./alerts";
  */
 type PollingMethod = "activity" | "positions";
 
+/**
+ * Granular latency sample for a single trade execution.
+ * All values in milliseconds.
+ */
+interface LatencySample {
+  /** Time from on-chain finalization to bot detection (includes API indexing delay) */
+  detectionMs: number;
+  /** Total bot processing time: data fetch + analysis + risk checks + order execution */
+  executionMs: number;
+  /** End-to-end: from on-chain finalization to order fill */
+  totalMs: number;
+  /** Time spent on data fetching, analysis, and risk checks (before order submission) */
+  processingMs: number;
+  /** Time spent on actual order execution (executor.execute() call) */
+  orderMs: number;
+  /** Network round-trip time for the API poll that detected this trade */
+  pollNetworkMs: number;
+  /** Estimated API indexing delay (detection minus poll network time) */
+  apiIndexingDelayMs: number;
+}
+
 // Load environment variables
 dotenv.config();
 
@@ -113,11 +134,7 @@ class CopyTradingBot {
   private tradeCount: number = 0;
 
   // Latency tracking (ring buffer for O(1) insert)
-  private latencySamples: Array<{
-    detectionLatencyMs: number;
-    executionLatencyMs: number;
-    totalLatencyMs: number;
-  }> = [];
+  private latencySamples: Array<LatencySample> = [];
   private latencyWriteIndex: number = 0;
   private latencySampleCount: number = 0;
   private maxLatencySamples: number = 100;
@@ -600,18 +617,31 @@ class CopyTradingBot {
       : undefined;
 
     try {
+      const orderSubmitTime = Date.now();
       const result = await this.executor.execute(order);
 
       const executionEndTime = Date.now();
+      const processingMs = orderSubmitTime - executionStartTime;
+      const orderMs = executionEndTime - orderSubmitTime;
       const executionLatencyMs = executionEndTime - executionStartTime;
       const totalLatencyMs = executionEndTime - trade.timestamp.getTime();
 
-      // Apply clock drift calibration
+      // Apply clock drift calibration (only affects timestamps relative to trade.timestamp)
       const detectionLatencyCorrected = latency.detectionLatencyMs - this.clockDriftOffset;
       const totalLatencyCorrected = totalLatencyMs - this.clockDriftOffset;
+      // Estimate API indexing delay: detection minus the poll network round-trip
+      const apiIndexingDelayMs = Math.max(0, detectionLatencyCorrected - latency.pollNetworkMs);
 
       // Record latency sample (use corrected values)
-      this.recordLatencySample(detectionLatencyCorrected, executionLatencyMs, totalLatencyCorrected);
+      this.recordLatencySample({
+        detectionMs: detectionLatencyCorrected,
+        executionMs: executionLatencyMs,
+        totalMs: totalLatencyCorrected,
+        processingMs,
+        orderMs,
+        pollNetworkMs: latency.pollNetworkMs,
+        apiIndexingDelayMs,
+      });
 
       // Compute per-trade P&L for sells (works for both filled and partial)
       const fillPrice = result.avgFillPrice || order.price;
@@ -625,12 +655,18 @@ class CopyTradingBot {
         console.log(`[EXEC] Order ID: ${result.orderId}`);
         console.log(`[EXEC] Mode: ${result.executionMode.toUpperCase()}`);
 
-        // Show calibrated latency
-        if (Math.abs(this.clockDriftOffset) > 1) {
-          console.log(`[LATENCY] Detection: ${detectionLatencyCorrected.toFixed(0)}ms | Execution: ${executionLatencyMs}ms | Total: ${totalLatencyCorrected.toFixed(0)}ms (calibrated)`);
-        } else {
-          console.log(`[LATENCY] Detection: ${latency.detectionLatencyMs}ms | Execution: ${executionLatencyMs}ms | Total: ${totalLatencyMs}ms`);
-        }
+        // Show detailed latency waterfall
+        const calibrated = Math.abs(this.clockDriftOffset) > 1 ? " (calibrated)" : "";
+        const detectionDisplay = Math.abs(this.clockDriftOffset) > 1 ? detectionLatencyCorrected.toFixed(0) : latency.detectionLatencyMs;
+        const totalDisplay = Math.abs(this.clockDriftOffset) > 1 ? totalLatencyCorrected.toFixed(0) : totalLatencyMs;
+        console.log(`[LATENCY] Waterfall breakdown${calibrated}:`);
+        console.log(`  API indexing delay : ~${apiIndexingDelayMs.toFixed(0)}ms`);
+        console.log(`  Poll network RTT  : ${latency.pollNetworkMs}ms`);
+        console.log(`  Detection (total) : ${detectionDisplay}ms`);
+        console.log(`  Processing        : ${processingMs}ms (data fetch + analysis + risk)`);
+        console.log(`  Order execution   : ${orderMs}ms`);
+        console.log(`  Bot execution     : ${executionLatencyMs}ms (processing + order)`);
+        console.log(`  Total (end-to-end): ${totalDisplay}ms`);
       } else {
         console.log(`[EXEC] ${result.status.toUpperCase()}: ${result.error || "Unknown error"}`);
       }
@@ -646,6 +682,8 @@ class CopyTradingBot {
           detectionLatencyMs: Math.round(detectionLatencyCorrected),
           executionLatencyMs,
           totalLatencyMs: Math.round(totalLatencyCorrected),
+          processingLatencyMs: processingMs,
+          orderLatencyMs: orderMs,
         });
         this.dashboard?.notifyTrade({
           side: order.side, size: result.filledSize,
@@ -685,9 +723,9 @@ class CopyTradingBot {
   /**
    * Record a latency sample for statistics
    */
-  private recordLatencySample(detectionLatencyMs: number, executionLatencyMs: number, totalLatencyMs: number): void {
+  private recordLatencySample(sample: LatencySample): void {
     // Ring buffer: O(1) insert, no shift/splice needed
-    this.latencySamples[this.latencyWriteIndex] = { detectionLatencyMs, executionLatencyMs, totalLatencyMs };
+    this.latencySamples[this.latencyWriteIndex] = sample;
     this.latencyWriteIndex = (this.latencyWriteIndex + 1) % this.maxLatencySamples;
     if (this.latencySampleCount < this.maxLatencySamples) {
       this.latencySampleCount++;
@@ -695,40 +733,90 @@ class CopyTradingBot {
   }
 
   /**
-   * Get latency statistics (already calibrated with clock drift offset)
+   * Compute a percentile value from a sorted array (nearest-rank method)
+   */
+  private percentile(sorted: number[], p: number): number {
+    if (sorted.length === 0) return 0;
+    const idx = Math.max(0, Math.ceil((p / 100) * sorted.length) - 1);
+    return sorted[idx];
+  }
+
+  /**
+   * Get latency statistics (already calibrated with clock drift offset).
+   * Returns per-component avg/min/max/p50/p95 breakdown.
    */
   getLatencyStats(): {
     avgDetectionMs: number;
     avgExecutionMs: number;
     avgTotalMs: number;
+    avgProcessingMs: number;
+    avgOrderMs: number;
+    avgPollNetworkMs: number;
+    avgApiIndexingDelayMs: number;
+    minTotalMs: number;
+    maxTotalMs: number;
+    p50TotalMs: number;
+    p95TotalMs: number;
+    minDetectionMs: number;
+    maxDetectionMs: number;
     sampleCount: number;
     clockDriftOffset: number;
   } {
     const count = this.latencySampleCount;
-    if (count === 0) {
-      return {
-        avgDetectionMs: 0,
-        avgExecutionMs: 0,
-        avgTotalMs: 0,
-        sampleCount: 0,
-        clockDriftOffset: this.clockDriftOffset,
-      };
-    }
+    const empty = {
+      avgDetectionMs: 0,
+      avgExecutionMs: 0,
+      avgTotalMs: 0,
+      avgProcessingMs: 0,
+      avgOrderMs: 0,
+      avgPollNetworkMs: 0,
+      avgApiIndexingDelayMs: 0,
+      minTotalMs: 0,
+      maxTotalMs: 0,
+      p50TotalMs: 0,
+      p95TotalMs: 0,
+      minDetectionMs: 0,
+      maxDetectionMs: 0,
+      sampleCount: 0,
+      clockDriftOffset: this.clockDriftOffset,
+    };
+    if (count === 0) return empty;
 
-    let sumDetection = 0;
-    let sumExecution = 0;
-    let sumTotal = 0;
+    let sumDetection = 0, sumExecution = 0, sumTotal = 0;
+    let sumProcessing = 0, sumOrder = 0, sumPollNetwork = 0, sumApiIndexing = 0;
+    const totalValues: number[] = [];
+    const detectionValues: number[] = [];
+
     for (let i = 0; i < count; i++) {
       const s = this.latencySamples[i];
-      sumDetection += s.detectionLatencyMs;
-      sumExecution += s.executionLatencyMs;
-      sumTotal += s.totalLatencyMs;
+      sumDetection += s.detectionMs;
+      sumExecution += s.executionMs;
+      sumTotal += s.totalMs;
+      sumProcessing += s.processingMs;
+      sumOrder += s.orderMs;
+      sumPollNetwork += s.pollNetworkMs;
+      sumApiIndexing += s.apiIndexingDelayMs;
+      totalValues.push(s.totalMs);
+      detectionValues.push(s.detectionMs);
     }
+
+    totalValues.sort((a, b) => a - b);
+    detectionValues.sort((a, b) => a - b);
 
     return {
       avgDetectionMs: Math.round(sumDetection / count),
       avgExecutionMs: Math.round(sumExecution / count),
       avgTotalMs: Math.round(sumTotal / count),
+      avgProcessingMs: Math.round(sumProcessing / count),
+      avgOrderMs: Math.round(sumOrder / count),
+      avgPollNetworkMs: Math.round(sumPollNetwork / count),
+      avgApiIndexingDelayMs: Math.round(sumApiIndexing / count),
+      minTotalMs: totalValues[0],
+      maxTotalMs: totalValues[totalValues.length - 1],
+      p50TotalMs: Math.round(this.percentile(totalValues, 50)),
+      p95TotalMs: Math.round(this.percentile(totalValues, 95)),
+      minDetectionMs: detectionValues[0],
+      maxDetectionMs: detectionValues[detectionValues.length - 1],
       sampleCount: count,
       clockDriftOffset: this.clockDriftOffset,
     };
@@ -1548,13 +1636,19 @@ async function main() {
     console.log(`║  Trades executed:   ${String(stats.tradeCount).padEnd(38)}║`);
     console.log(`║  Total P&L:         $${stats.totalPnL.toFixed(2).padEnd(36)}║`);
     if (stats.latencyStats.sampleCount > 0) {
-      const latencyLabel = Math.abs(stats.latencyStats.clockDriftOffset) > 1
-        ? `${stats.latencyStats.avgTotalMs}ms (calibrated)`
-        : `${stats.latencyStats.avgTotalMs}ms`;
-      console.log(`║  Avg Latency:       ${String(latencyLabel).padEnd(38)}║`);
-      if (Math.abs(stats.latencyStats.clockDriftOffset) > 1) {
-        const driftSign = stats.latencyStats.clockDriftOffset >= 0 ? '+' : '';
-        console.log(`║  Clock Drift:       ${String(driftSign + stats.latencyStats.clockDriftOffset.toFixed(1) + 'ms corrected').padEnd(38)}║`);
+      const ls = stats.latencyStats;
+      const calibrated = Math.abs(ls.clockDriftOffset) > 1 ? " (calibrated)" : "";
+      console.log(`║  Latency${calibrated}:`.padEnd(60) + "║");
+      console.log(`║    Total (avg/min/max): ${ls.avgTotalMs}/${ls.minTotalMs}/${ls.maxTotalMs}ms`.padEnd(60) + "║");
+      console.log(`║    Total (p50/p95):     ${ls.p50TotalMs}/${ls.p95TotalMs}ms`.padEnd(60) + "║");
+      console.log(`║    Detection (avg):     ${ls.avgDetectionMs}ms`.padEnd(60) + "║");
+      console.log(`║    API indexing (avg):  ~${ls.avgApiIndexingDelayMs}ms`.padEnd(60) + "║");
+      console.log(`║    Processing (avg):    ${ls.avgProcessingMs}ms`.padEnd(60) + "║");
+      console.log(`║    Order exec (avg):    ${ls.avgOrderMs}ms`.padEnd(60) + "║");
+      console.log(`║    Samples:             ${ls.sampleCount}`.padEnd(60) + "║");
+      if (Math.abs(ls.clockDriftOffset) > 1) {
+        const driftSign = ls.clockDriftOffset >= 0 ? '+' : '';
+        console.log(`║    Clock drift:         ${driftSign}${ls.clockDriftOffset.toFixed(1)}ms corrected`.padEnd(60) + "║");
       }
     }
     console.log("╚═══════════════════════════════════════════════════════════╝");

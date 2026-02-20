@@ -196,6 +196,7 @@ export async function runActivityPollerTests() {
       detectionLatencyMs: detectedAt.getTime() - tradeTime.getTime(),
       tradeTimestamp: tradeTime,
       detectedAt,
+      pollNetworkMs: 50,
     };
 
     assertTrue(latency.detectionLatencyMs >= 1900, 'Latency should be ~2000ms');

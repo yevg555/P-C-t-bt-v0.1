@@ -34,6 +34,8 @@ export interface TradeLatency {
   tradeTimestamp: Date;
   /** Timestamp when we detected the trade */
   detectedAt: Date;
+  /** Network round-trip time for the poll API call that detected this trade (ms) */
+  pollNetworkMs: number;
 }
 
 /**
@@ -290,6 +292,7 @@ export class ActivityPoller extends EventEmitter<ActivityPollerEvents> {
             detectionLatencyMs,
             tradeTimestamp: trade.timestamp,
             detectedAt,
+            pollNetworkMs: pollLatencyMs,
           };
 
           this.logTrade(trade, latency);

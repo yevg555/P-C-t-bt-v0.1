@@ -10,6 +10,7 @@ import { execSync } from 'child_process';
 import { join } from 'path';
 
 const tests = [
+  { name: 'Token Bucket Rate Limiter', file: 'token-bucket.test.ts' },
   { name: 'Position Cache', file: 'position-cache.test.ts' },
   { name: 'Change Detector', file: 'change-detector.test.ts' },
   { name: 'Copy Size Calculator', file: 'copy-size.test.ts' },
@@ -35,7 +36,7 @@ for (const test of tests) {
   console.log('═'.repeat(50));
   
   try {
-    execSync(`npx ts-node tests/${test.file}`, {
+    execSync(`node node_modules/ts-node/dist/bin.js tests/${test.file}`, {
       cwd: join(__dirname, '..'),
       stdio: 'inherit',
     });

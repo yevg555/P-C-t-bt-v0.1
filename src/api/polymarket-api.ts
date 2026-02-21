@@ -21,6 +21,7 @@
 
 import { Agent, fetch as undiciFetch } from "undici";
 import { Position, RawPositionResponse } from "../types";
+import { TokenBucket } from "../utils/token-bucket";
 
 /**
  * Undici HTTP agent with persistent keep-alive connections.
@@ -193,8 +194,9 @@ export class PolymarketAPI {
   private lastPositionsRequestTime = 0;
   private minPositionsRequestInterval = 67; // 15 req/sec for /positions
 
-  private lastClobRequestTime = 0;
-  private minClobRequestInterval = 7; // 150 req/sec for CLOB /price & /book
+  // CLOB Rate Limiter (Token Bucket for burst support)
+  // Capacity = 150 (1s burst), Rate = 150 req/sec
+  private clobTokenBucket = new TokenBucket(150, 150);
 
   // Portfolio value cache: address -> cached value
   private portfolioValueCache: Map<string, CachedPortfolioValue> = new Map();
@@ -1016,18 +1018,11 @@ export class PolymarketAPI {
   }
 
   /**
-   * Rate limit for CLOB API (prices, orderbook) (~150 calls/10s = 15/sec)
+   * Rate limit for CLOB API (prices, orderbook) (~1500 calls/10s = 150/sec)
+   * Uses TokenBucket to allow bursts while maintaining average rate.
    */
   private async respectClobRateLimit(): Promise<void> {
-    const now = Date.now();
-    const timeSinceLastRequest = now - this.lastClobRequestTime;
-
-    if (timeSinceLastRequest < this.minClobRequestInterval) {
-      const waitTime = this.minClobRequestInterval - timeSinceLastRequest;
-      await this.sleep(waitTime);
-    }
-
-    this.lastClobRequestTime = Date.now();
+    await this.clobTokenBucket.consume();
   }
 
   private transformPositions(data: unknown): Position[] {

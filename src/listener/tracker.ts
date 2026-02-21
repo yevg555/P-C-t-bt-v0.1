@@ -120,6 +120,7 @@ export class Tracker extends EventEmitter {
     // (Maker orders are passive limit orders filled by someone else;
     // copying them typically results in adverse selection/latency arbitrage against us)
     if (isMaker && !this.copyMakerOrders) {
+      console.log(`[Tracker] Ignoring Maker order from target (COPY_MAKER_ORDERS=false)`);
       return;
     }
 
@@ -178,6 +179,7 @@ export class Tracker extends EventEmitter {
         marketId = await this.api.getMarketId(tokenId);
         if (marketId) {
           this.marketIdCache.set(tokenId, marketId);
+          console.log(`[Tracker] Cached new Market ID ${marketId} for Token ${tokenId.slice(0, 8)}...`);
         }
       } catch (err) {
         console.warn(`[Tracker] Could not fetch market ID for ${tokenId}: ${err}`);

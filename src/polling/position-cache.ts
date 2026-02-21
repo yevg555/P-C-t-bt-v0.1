@@ -69,6 +69,14 @@ export class PositionCache {
   getAllReadonly(): ReadonlyArray<Readonly<Position>> {
     return Array.from(this.cache.values());
   }
+
+  /**
+   * Get the internal map as a readonly map.
+   * Efficient for lookups without cloning or array allocation.
+   */
+  getMapReadonly(): ReadonlyMap<string, Position> {
+    return this.cache;
+  }
   
   /**
    * Get all token IDs in the cache

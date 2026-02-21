@@ -183,7 +183,8 @@ export class PositionPoller extends EventEmitter<PollerEvents> {
       const currentPositions = await this.api.getPositions(this.config.traderAddress);
       
       // 2. Get previous positions (readonly — change detector only reads, never mutates)
-      const previousPositions = this.cache.getAllReadonly() as Position[];
+      // PERFORMANCE OPTIMIZATION: Pass the map directly to avoid array allocation
+      const previousPositions = this.cache.getMapReadonly();
 
       // 3. Detect changes (skip on first poll - just initializing)
       if (!this.cache.isEmpty()) {

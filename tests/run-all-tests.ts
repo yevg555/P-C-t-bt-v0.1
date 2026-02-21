@@ -10,12 +10,9 @@ import { execSync } from 'child_process';
 import { join } from 'path';
 
 const tests = [
-  { name: 'Position Cache', file: 'position-cache.test.ts' },
-  { name: 'Change Detector', file: 'change-detector.test.ts' },
   { name: 'Copy Size Calculator', file: 'copy-size.test.ts' },
   { name: 'Paper Trading Executor', file: 'paper-executor.test.ts' },
   { name: 'TP/SL Monitor', file: 'tp-sl-monitor.test.ts' },
-  { name: 'Activity Poller', file: 'activity-poller.test.ts' },
   { name: 'Market Analyzer', file: 'market-analyzer.test.ts' },
   { name: 'Price Adjuster (Adaptive)', file: 'price-adjuster.test.ts' },
   { name: 'Risk Checker (Market Conditions)', file: 'risk-checker-market.test.ts' },

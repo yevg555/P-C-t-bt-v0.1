@@ -57,7 +57,9 @@ export class DashboardServer {
   private bot: DashboardBotInterface;
   private statsInterval: NodeJS.Timeout | null = null;
   private positionsInterval: NodeJS.Timeout | null = null;
+  private pingInterval: NodeJS.Timeout | null = null;
   private port: number;
+  private readonly MAX_CLIENTS = 50;
 
   constructor(bot: DashboardBotInterface, port: number = 3456) {
     this.bot = bot;
@@ -229,6 +231,18 @@ export class DashboardServer {
 
   private setupWebSocket(): void {
     this.wss.on("connection", (ws) => {
+      // Security: Limit max concurrent connections
+      if (this.wss.clients.size > this.MAX_CLIENTS) {
+        ws.close(1013, "Too many clients");
+        return;
+      }
+
+      // Security: Alive tracking
+      (ws as any).isAlive = true;
+      ws.on("pong", () => {
+        (ws as any).isAlive = true;
+      });
+
       // Send initial state immediately on connect
       this.sendStatsToClient(ws);
       this.sendPositionsToClient(ws);
@@ -329,6 +343,17 @@ export class DashboardServer {
         // Ignore broadcast errors
       }
     }, 5000);
+
+    // Heartbeat for cleanup
+    this.pingInterval = setInterval(() => {
+      this.wss.clients.forEach((ws) => {
+        if ((ws as any).isAlive === false) {
+          return ws.terminate();
+        }
+        (ws as any).isAlive = false;
+        ws.ping();
+      });
+    }, 30000);
   }
 
   stop(): void {
@@ -339,6 +364,10 @@ export class DashboardServer {
     if (this.positionsInterval) {
       clearInterval(this.positionsInterval);
       this.positionsInterval = null;
+    }
+    if (this.pingInterval) {
+      clearInterval(this.pingInterval);
+      this.pingInterval = null;
     }
     this.wss.close();
     this.httpServer.close();

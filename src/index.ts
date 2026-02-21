@@ -7,18 +7,15 @@
  * paper trading or live trading modes.
  *
  * Flow:
- * 1. Poll trader's positions for changes
- * 2. When a change is detected, calculate copy size
+ * 1. Listen for OrderFilled events via WebSocket (Tracker)
+ * 2. When a trade is detected, calculate copy size
  * 3. Check risk limits
  * 4. Execute order (paper or live)
  */
 
 import * as dotenv from "dotenv";
 import * as readline from "readline";
-import { PositionPoller } from "./polling";
-import { ActivityPoller, TradeEvent } from "./polling/activity-poller";
-import { MarketWebSocket } from "./polling/market-websocket";
-import { PolymarketAPI, Trade } from "./api/polymarket-api";
+import { PolymarketAPI } from "./api/polymarket-api";
 import { CopySizeCalculator } from "./strategy/copy-size";
 import { RiskChecker, TradingState } from "./strategy/risk-checker";
 import { PriceAdjuster } from "./strategy/price-adjuster";
@@ -45,17 +42,9 @@ import { TradeStore } from "./storage";
 import { DashboardServer } from "./dashboard";
 import { AlertService } from "./alerts";
 
-/**
- * Polling method determines how we detect trader's trades
- * - 'activity': Poll /activity endpoint for actual trades (recommended)
- *   - Exact timestamps for latency measurement
- *   - Exact execution prices
- *   - Incremental fetching with `after` parameter
- * - 'positions': Poll /positions endpoint and diff (legacy)
- *   - State-based change detection
- *   - No exact trade timestamps
- */
-type PollingMethod = "activity" | "positions";
+// Listener imports
+import { createViemClient } from "./listener/provider";
+import { Tracker, TradeEvent } from "./listener/tracker";
 
 // Load environment variables
 dotenv.config();
@@ -64,10 +53,8 @@ dotenv.config();
  * Main bot class that orchestrates all components
  */
 class CopyTradingBot {
-  // Polling - supports both activity-based and position-based
-  private pollingMethod: PollingMethod;
-  private positionPoller: PositionPoller | null = null;
-  private activityPoller: ActivityPoller | null = null;
+  // Listener
+  private tracker: Tracker | null = null;
 
   private api: PolymarketAPI;
   private sizeCalculator: CopySizeCalculator;
@@ -83,9 +70,8 @@ class CopyTradingBot {
 
   // 1-Click Sell state
   private oneClickSellEnabled: boolean;
-  private keyboardListener: readline.Interface | null = null;
 
-  // Price optimization: skip market price fetch when using activity polling
+  // Price optimization: skip market price fetch when using activity polling (or listener)
   private useTraderPrice: boolean;
 
   // Portfolio value prefetch interval
@@ -95,8 +81,8 @@ class CopyTradingBot {
   // Watched token IDs for price cache warming (from trader's positions)
   private watchedTokenIds: Set<string> = new Set();
 
-  // Hybrid WebSocket trigger (Tier 3H)
-  private marketWebSocket: MarketWebSocket | null = null;
+  // Trader's position state (tokenId -> quantity)
+  private traderPositions: Map<string, number> = new Map();
 
   // Trade history persistence
   private tradeStore: TradeStore;
@@ -142,33 +128,27 @@ class CopyTradingBot {
       process.exit(1);
     }
 
+    const rpcUrl = process.env.POLYGON_WSS_RPC_URL;
+    if (!rpcUrl) {
+      console.error("ERROR: Please set POLYGON_WSS_RPC_URL in your .env file");
+      process.exit(1);
+    }
+
     // Set up trader config with tag
     this.traderConfig = {
       address: traderAddress,
       tag: process.env.TRADER_TAG || undefined,
     };
 
-    const intervalMs = parseInt(process.env.POLLING_INTERVAL_MS || "1000");
-
     // Initialize components
     this.api = new PolymarketAPI();
 
-    // Choose polling method: activity (recommended) or positions (legacy)
-    this.pollingMethod = (process.env.POLLING_METHOD as PollingMethod) || "activity";
-
-    const pollerConfig = {
-      traderAddress,
-      intervalMs,
-      maxConsecutiveErrors: parseInt(
-        process.env.MAX_CONSECUTIVE_ERRORS || "5"
-      ),
-    };
-
-    if (this.pollingMethod === "activity") {
-      this.activityPoller = new ActivityPoller(pollerConfig, this.api);
-    } else {
-      this.positionPoller = new PositionPoller(pollerConfig);
-    }
+    // Initialize Viem Client and Tracker
+    const client = createViemClient(rpcUrl);
+    this.tracker = new Tracker({
+      traderAddresses: [traderAddress],
+      copyMakerOrders: process.env.COPY_MAKER_ORDERS === "true",
+    }, client, this.api);
 
     this.sizeCalculator = new CopySizeCalculator({
       sizingMethod:
@@ -239,7 +219,7 @@ class CopyTradingBot {
     this.oneClickSellEnabled = process.env.ONE_CLICK_SELL_ENABLED !== "false";
 
     // Price optimization: use trader's execution price instead of fetching market price
-    // Only effective when using activity polling (which provides exact trade prices)
+    // Only effective when using listener (which provides exact trade prices)
     this.useTraderPrice = process.env.USE_TRADER_PRICE === "true";
 
     // Trade history persistence (SQLite)
@@ -258,54 +238,16 @@ class CopyTradingBot {
   }
 
   /**
-   * Set up event handlers for the poller
+   * Set up event handlers for the tracker
    */
   private setupEventHandlers(): void {
-    if (this.activityPoller) {
-      // Activity-based polling (recommended)
-      this.activityPoller.on("trade", async (event: TradeEvent) => {
+    if (this.tracker) {
+      this.tracker.on("trade", async (event: TradeEvent) => {
         await this.handleTradeEvent(event);
       });
 
-      this.activityPoller.on("error", (error: Error) => {
-        console.error(`[BOT] Poller error: ${error.message}`);
-      });
-
-      this.activityPoller.on("degraded", (errorCount: number) => {
-        console.log("");
-        console.log("WARNING: Bot is in degraded state");
-        console.log("   Check your internet connection and API status");
-        console.log(`   Consecutive errors: ${errorCount}`);
-        console.log("");
-        this.alertService.pollerDegraded(errorCount);
-      });
-
-      this.activityPoller.on("recovered", () => {
-        console.log("[BOT] Poller recovered from errors");
-        this.alertService.pollerRecovered();
-      });
-    } else if (this.positionPoller) {
-      // Position-based polling (legacy)
-      this.positionPoller.on("change", async (change: PositionChange) => {
-        await this.handlePositionChange(change);
-      });
-
-      this.positionPoller.on("error", (error: Error) => {
-        console.error(`[BOT] Poller error: ${error.message}`);
-      });
-
-      this.positionPoller.on("degraded", (errorCount: number) => {
-        console.log("");
-        console.log("WARNING: Bot is in degraded state");
-        console.log("   Check your internet connection and API status");
-        console.log(`   Consecutive errors: ${errorCount}`);
-        console.log("");
-        this.alertService.pollerDegraded(errorCount);
-      });
-
-      this.positionPoller.on("recovered", () => {
-        console.log("[BOT] Poller recovered from errors");
-        this.alertService.pollerRecovered();
+      this.tracker.on("error", (error: Error) => {
+        console.error(`[BOT] Tracker error: ${error.message}`);
       });
     }
 
@@ -316,7 +258,7 @@ class CopyTradingBot {
   }
 
   /**
-   * Handle a trade event from the ActivityPoller
+   * Handle a trade event from the Tracker
    * This is the recommended method - provides exact timestamps and prices
    */
   private async handleTradeEvent(event: TradeEvent): Promise<void> {
@@ -347,17 +289,25 @@ class CopyTradingBot {
     }
     console.log("=".repeat(60));
 
+    // Update local state
+    const previousQuantity = this.traderPositions.get(trade.tokenId) || 0;
+    let currentQuantity = previousQuantity;
+    if (trade.side === "BUY") {
+      currentQuantity += trade.size;
+    } else {
+      currentQuantity = Math.max(0, currentQuantity - trade.size);
+    }
+    this.traderPositions.set(trade.tokenId, currentQuantity);
+
     // Convert Trade to PositionChange for compatibility with existing code
-    // For activity polling, we use the actual trade data
+    // For listener, we use the actual trade data
     const change: PositionChange = {
       tokenId: trade.tokenId,
       marketId: trade.marketId,
       side: trade.side,
       delta: trade.size,
-      // For activity polling, we don't have the previous/current position quantities
-      // Use the trade size as delta
-      previousQuantity: trade.side === "BUY" ? 0 : trade.size,
-      currentQuantity: trade.side === "BUY" ? trade.size : 0,
+      previousQuantity,
+      currentQuantity,
       detectedAt: latency.detectedAt,
       marketTitle: trade.marketTitle,
       curPrice: trade.price,
@@ -801,188 +751,6 @@ class CopyTradingBot {
   }
 
   /**
-   * Handle a detected position change
-   */
-  private async handlePositionChange(change: PositionChange): Promise<void> {
-    const startTime = Date.now();
-    const traderTag = this.traderConfig.tag || this.traderConfig.address.slice(0, 10);
-
-    console.log("");
-    console.log("=".repeat(60));
-    console.log(`[${traderTag}] TRADE DETECTED: ${change.side} ${change.delta.toFixed(2)} shares`);
-    console.log(`Token: ${change.tokenId.slice(0, 20)}...`);
-    if (change.marketTitle) {
-      console.log(`Market: ${change.marketTitle}`);
-    }
-    console.log("=".repeat(60));
-
-    // Get our current position (only needed for SELL — skip API call for BUY)
-    const yourPosition = change.side === "SELL"
-      ? await this.executor.getPosition(change.tokenId)
-      : 0;
-
-    // Step 1: Should we copy this trade?
-    const shouldCopy = this.sizeCalculator.shouldCopy(change, yourPosition);
-    if (!shouldCopy.copy) {
-      console.log(`[SKIP] ${shouldCopy.reason}`);
-      return;
-    }
-
-    // Step 2: Get current market price
-    let currentPrice: number;
-    try {
-      currentPrice = await this.api.getPrice(change.tokenId, change.side);
-      console.log(`[PRICE] Market price: $${currentPrice.toFixed(4)}`);
-    } catch (error) {
-      console.error(`[ERROR] Failed to get price: ${error}`);
-      // Fall back to curPrice from change if available
-      if (change.curPrice && change.curPrice > 0) {
-        currentPrice = change.curPrice;
-        console.log(`[PRICE] Using cached price: $${currentPrice.toFixed(4)}`);
-      } else {
-        console.log("[SKIP] Cannot determine price");
-        return;
-      }
-    }
-
-    // Step 3: Calculate copy size
-    const balance = await this.executor.getBalance();
-
-    // Get trader portfolio value for proportional_to_trader sizing
-    // Try cached value first (sync, zero latency), fallback to API call
-    let traderPortfolioValue: number | undefined =
-      this.api.getCachedPortfolioValue(this.traderConfig.address);
-
-    if (traderPortfolioValue === undefined) {
-      try {
-        traderPortfolioValue = await this.api.getPortfolioValue(this.traderConfig.address);
-      } catch (error) {
-        // Non-fatal: calculator will use fallback if undefined
-        console.warn(`[SIZE] Could not get trader portfolio value: ${error}`);
-      }
-    }
-
-    const sizeResult = this.sizeCalculator.calculate({
-      change,
-      currentPrice,
-      yourBalance: balance,
-      yourPosition,
-      traderPortfolioValue,
-    });
-
-    console.log(`[SIZE] ${sizeResult.reason}`);
-    if (sizeResult.adjustments.length > 0) {
-      sizeResult.adjustments.forEach((adj) => console.log(`  - ${adj}`));
-    }
-
-    if (sizeResult.shares === 0) {
-      console.log("[SKIP] Calculated size is 0");
-      return;
-    }
-
-    // Step 4: Adjust price for better fill
-    const adjustedPrice = this.priceAdjuster.adjust(currentPrice, change.side);
-    const priceDetails = this.priceAdjuster.getAdjustmentDetails(
-      currentPrice,
-      change.side,
-      sizeResult.shares
-    );
-    console.log(`[PRICE] ${priceDetails.description}`);
-
-    // Step 5: Create order spec
-    const orderConfig = this.sizeCalculator.getOrderConfig();
-    const expiresInMs = orderConfig.expirationSeconds * 1000;
-
-    const order: OrderSpec = {
-      tokenId: change.tokenId,
-      side: change.side,
-      size: sizeResult.shares,
-      price: adjustedPrice,
-      orderType: orderConfig.orderType,
-      expiresInMs: expiresInMs > 0 ? expiresInMs : undefined,
-      expiresAt: expiresInMs > 0 ? new Date(Date.now() + expiresInMs) : undefined,
-      priceOffsetBps: orderConfig.priceOffsetBps,
-      triggeredBy: change,
-    };
-
-    console.log(`[ORDER] Type: ${order.orderType?.toUpperCase()}, Expires: ${order.expiresInMs ? `${orderConfig.expirationSeconds}s` : 'GTC'}`);
-
-    // Step 6: Risk check
-    const tradingState = await this.getTradingState();
-    const riskResult = this.riskChecker.check(order, tradingState);
-
-    if (!riskResult.approved) {
-      console.log(`[RISK] REJECTED: ${riskResult.reason}`);
-      this.alertService.tradeRejected(`Risk: ${riskResult.reason}`);
-      return;
-    }
-
-    if (riskResult.warnings.length > 0) {
-      console.log(`[RISK] Warnings:`);
-      riskResult.warnings.forEach((w) => console.log(`  - ${w}`));
-    }
-
-    console.log(`[RISK] Approved (level: ${riskResult.riskLevel})`);
-
-    // Step 7: Execute the order
-    console.log(`[EXEC] Executing ${order.side} ${order.size} @ $${order.price.toFixed(4)}...`);
-
-    // Capture entry price BEFORE execution so sell P&L can be computed without races
-    const entryPriceLegacy = order.side === "SELL"
-      ? this.getEntryPriceForToken(order.tokenId)
-      : undefined;
-
-    try {
-      const result = await this.executor.execute(order);
-
-      const latencyMs = Date.now() - startTime;
-
-      const fillPriceLegacy = result.avgFillPrice || order.price;
-      const tradePnl = order.side === "SELL" && result.filledSize > 0 && entryPriceLegacy !== undefined
-        ? (fillPriceLegacy - entryPriceLegacy) * result.filledSize
-        : undefined;
-
-      if (result.status === "filled") {
-        this.tradeCount++;
-        console.log(`[EXEC] FILLED: ${result.filledSize} shares @ $${result.avgFillPrice?.toFixed(4) || order.price.toFixed(4)}`);
-        console.log(`[EXEC] Order ID: ${result.orderId}`);
-        console.log(`[EXEC] Mode: ${result.executionMode.toUpperCase()}`);
-        console.log(`[EXEC] Latency: ${latencyMs}ms (detection → execution)`);
-      } else {
-        console.log(`[EXEC] ${result.status.toUpperCase()}: ${result.error || "Unknown error"}`);
-      }
-
-      // Persist trade to database
-      try {
-        this.tradeStore.recordTrade({
-          order,
-          result,
-          traderAddress: this.traderConfig.address,
-          pnl: tradePnl,
-          executionLatencyMs: latencyMs,
-        });
-        this.dashboard?.notifyTrade({
-          side: order.side, size: result.filledSize,
-          price: result.avgFillPrice || order.price, pnl: tradePnl,
-          status: result.status, tokenId: order.tokenId,
-        });
-      } catch (dbError) {
-        console.warn(`[DB] Failed to persist trade: ${dbError}`);
-      }
-
-      if (result.status === "filled" || result.filledSize > 0) {
-        this.alertService.tradeFilled(order.side, result.filledSize, fillPriceLegacy, tradePnl);
-      }
-    } catch (error) {
-      console.error(`[EXEC] Execution failed: ${error}`);
-      this.alertService.tradeFailed(String(error));
-    }
-
-    console.log("=".repeat(60));
-    console.log("");
-  }
-
-  /**
    * Get current trading state for risk checks
    * @param cachedBalance - Optional pre-fetched balance to avoid redundant API call
    */
@@ -1044,8 +812,7 @@ class CopyTradingBot {
 
     console.log(`  Mode:            ${getTradingMode().toUpperCase()}`);
     console.log(`  Trader:          ${traderDisplay}`);
-    console.log(`  Polling Method:  ${this.pollingMethod.toUpperCase()}`);
-    console.log(`  Poll Interval:   ${process.env.POLLING_INTERVAL_MS || 1000}ms`);
+    console.log(`  Polling Method:  WEBSOCKET (Viem)`);
     console.log(`  Sizing:          ${process.env.SIZING_METHOD || "proportional_to_portfolio"}`);
     console.log(`  Portfolio %:     ${(parseFloat(process.env.PORTFOLIO_PERCENTAGE || "0.05") * 100).toFixed(1)}%`);
     console.log(`  SELL Strategy:   ${process.env.SELL_STRATEGY || "proportional"}`);
@@ -1086,7 +853,7 @@ class CopyTradingBot {
     const startingBalance = await this.executor.getBalance();
     const sessionId = this.tradeStore.startSession({
       tradingMode: getTradingMode(),
-      pollingMethod: this.pollingMethod,
+      pollingMethod: 'activity', // Keep 'activity' for DB compatibility or use 'websocket'
       traderAddress: this.traderConfig.address,
       startingBalance,
     });
@@ -1113,11 +880,12 @@ class CopyTradingBot {
     await this.runStartupTests();
     console.log("");
 
-    // Start the appropriate poller
-    if (this.activityPoller) {
-      await this.activityPoller.start();
-    } else if (this.positionPoller) {
-      await this.positionPoller.start();
+    // Initialize trader state (cold start)
+    await this.initializeTraderState();
+
+    // Start the tracker
+    if (this.tracker) {
+      await this.tracker.start();
     }
 
     // Prefetch trader portfolio value and start periodic refresh
@@ -1140,6 +908,23 @@ class CopyTradingBot {
 
     console.log("Press Ctrl+C to stop" + (this.oneClickSellEnabled ? ", 'q' to sell all positions" : ""));
     console.log("");
+  }
+
+  /**
+   * Initialize trader state from API
+   */
+  private async initializeTraderState(): Promise<void> {
+    try {
+      console.log("[STATE] Fetching initial positions...");
+      const positions = await this.api.getPositions(this.traderConfig.address);
+      this.traderPositions.clear();
+      for (const p of positions) {
+        this.traderPositions.set(p.tokenId, p.quantity);
+      }
+      console.log(`[STATE] Initialized ${positions.length} positions for trader`);
+    } catch (error) {
+      console.warn(`[STATE] Failed to fetch initial positions: ${error}`);
+    }
   }
 
   /**
@@ -1248,48 +1033,10 @@ class CopyTradingBot {
             console.log(`[PREFETCH] Skipping ${deadCount} resolved markets (no orderbook), ${tokenIds.length - deadCount} active`);
           }
         }, 5000);
-
-        // Start hybrid WebSocket trigger (Tier 3H)
-        // WebSocket listens for real-time trade events on the trader's markets
-        // and triggers an immediate poll instead of waiting for the next interval
-        this.startMarketWebSocket(tokenIds);
       }
     } catch (error) {
       console.warn(`[PREFETCH] Could not start price cache warmer: ${error}`);
     }
-  }
-
-  /**
-   * Start the WebSocket trigger that fires immediate polls on trade signals
-   */
-  private startMarketWebSocket(tokenIds: string[]): void {
-    if (!this.activityPoller) {
-      return; // Only useful with activity polling
-    }
-
-    this.marketWebSocket = new MarketWebSocket();
-
-    const poller = this.activityPoller;
-
-    this.marketWebSocket.on('trade_signal', (tokenId: string) => {
-      // A trade happened on one of the trader's markets — poll immediately!
-      poller.triggerPollNow();
-    });
-
-    this.marketWebSocket.on('connected', () => {
-      console.log('[BOT] WebSocket trigger connected — hybrid mode active');
-    });
-
-    this.marketWebSocket.on('disconnected', (reason: string) => {
-      console.log(`[BOT] WebSocket trigger disconnected: ${reason} — falling back to polling-only`);
-    });
-
-    this.marketWebSocket.on('error', (error: Error) => {
-      // Non-fatal: polling continues as fallback
-      console.warn(`[BOT] WebSocket trigger error: ${error.message}`);
-    });
-
-    this.marketWebSocket.start(tokenIds);
   }
 
   /**
@@ -1299,11 +1046,6 @@ class CopyTradingBot {
     if (!this.watchedTokenIds.has(tokenId)) {
       this.watchedTokenIds.add(tokenId);
       this.api.updateWatchedTokens(Array.from(this.watchedTokenIds));
-
-      // Also update WebSocket subscriptions
-      if (this.marketWebSocket) {
-        this.marketWebSocket.updateTokens(Array.from(this.watchedTokenIds));
-      }
     }
   }
 
@@ -1397,10 +1139,8 @@ class CopyTradingBot {
    * Stop the bot
    */
   stop(): void {
-    if (this.activityPoller) {
-      this.activityPoller.stop();
-    } else if (this.positionPoller) {
-      this.positionPoller.stop();
+    if (this.tracker) {
+      this.tracker.stop();
     }
     this.tpSlMonitor.stopMonitoring();
 
@@ -1413,12 +1153,6 @@ class CopyTradingBot {
     // Stop price cache warmer and order book warmer
     this.api.stopPriceCacheWarmer();
     this.api.stopOrderBookWarmer();
-
-    // Stop WebSocket trigger
-    if (this.marketWebSocket) {
-      this.marketWebSocket.stop();
-      this.marketWebSocket = null;
-    }
 
     // Stop dashboard server
     if (this.dashboard) {
@@ -1436,25 +1170,23 @@ class CopyTradingBot {
    * Get bot statistics
    */
   getStats(): {
-    pollerStats: ReturnType<PositionPoller["getStats"]> | ReturnType<ActivityPoller["getStats"]>;
+    pollerStats: ReturnType<Tracker["getStats"]> | Record<string, any>;
     tradeCount: number;
     totalPnL: number;
     dailyPnL: number;
     mode: string;
-    pollingMethod: PollingMethod;
+    pollingMethod: string;
     latencyStats: ReturnType<CopyTradingBot["getLatencyStats"]>;
   } {
-    const pollerStats = this.activityPoller
-      ? this.activityPoller.getStats()
-      : this.positionPoller?.getStats() || {
+    const pollerStats = this.tracker
+      ? this.tracker.getStats()
+      : {
           isRunning: false,
-          isPaused: false,
-          pollCount: 0,
-          changesDetected: 0,
-          cacheSize: 0,
+          tradesDetected: 0,
+          lastBlock: "0",
           consecutiveErrors: 0,
-          lastPollTime: null,
-          traderAddress: this.traderConfig.address,
+          pollCount: 0,
+          changesDetected: 0
         };
 
     return {
@@ -1463,7 +1195,7 @@ class CopyTradingBot {
       totalPnL: this.totalPnL,
       dailyPnL: this.dailyPnL,
       mode: getTradingMode(),
-      pollingMethod: this.pollingMethod,
+      pollingMethod: "websocket",
       latencyStats: this.getLatencyStats(),
     };
   }
@@ -1488,9 +1220,7 @@ class CopyTradingBot {
   async endSession(): Promise<void> {
     const stats = this.getStats();
     const pollerStats = stats.pollerStats;
-    const tradesDetected = 'tradesDetected' in pollerStats
-      ? (pollerStats as { tradesDetected: number }).tradesDetected
-      : ('changesDetected' in pollerStats ? (pollerStats as { changesDetected: number }).changesDetected : 0);
+    const tradesDetected = pollerStats.tradesDetected || 0;
 
     let endingBalance = 0;
     try {
@@ -1501,7 +1231,7 @@ class CopyTradingBot {
 
     try {
       this.tradeStore.endSession({
-        pollsCompleted: pollerStats.pollCount,
+        pollsCompleted: pollerStats.pollCount || 0,
         tradesDetected,
         tradesExecuted: stats.tradeCount,
         totalPnl: stats.totalPnL,
@@ -1533,9 +1263,7 @@ async function main() {
 
     const stats = bot.getStats();
     const pollerStats = stats.pollerStats;
-    const tradesDetected = 'tradesDetected' in pollerStats
-      ? pollerStats.tradesDetected
-      : ('changesDetected' in pollerStats ? pollerStats.changesDetected : 0);
+    const tradesDetected = pollerStats.tradesDetected || 0;
 
     console.log("");
     console.log("╔═══════════════════════════════════════════════════════════╗");
@@ -1543,7 +1271,7 @@ async function main() {
     console.log("╠═══════════════════════════════════════════════════════════╣");
     console.log(`║  Mode:              ${stats.mode.toUpperCase().padEnd(38)}║`);
     console.log(`║  Polling Method:    ${stats.pollingMethod.toUpperCase().padEnd(38)}║`);
-    console.log(`║  Polls completed:   ${String(pollerStats.pollCount).padEnd(38)}║`);
+    console.log(`║  Blocks Processed:  ${String(pollerStats.pollCount || 0).padEnd(38)}║`);
     console.log(`║  Trades detected:   ${String(tradesDetected).padEnd(38)}║`);
     console.log(`║  Trades executed:   ${String(stats.tradeCount).padEnd(38)}║`);
     console.log(`║  Total P&L:         $${stats.totalPnL.toFixed(2).padEnd(36)}║`);

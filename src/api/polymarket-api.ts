@@ -981,6 +981,49 @@ export class PolymarketAPI {
   }
 
   // ===================================
+  // MARKET INFO
+  // ===================================
+
+  /**
+   * Get market ID (conditionId) for a given token ID
+   * Used to map WSS trade events (which only have tokenId) to markets for risk checks.
+   */
+  async getMarketId(tokenId: string): Promise<string> {
+    // Try CLOB API first
+    try {
+      // Note: Some docs suggest /markets/{id}, others query params.
+      // We try the singular lookup first.
+      const url = `${this.clobApiUrl}/markets/${tokenId}`;
+      const response = await this.fetch(url, { method: "GET" });
+
+      if (response.ok) {
+        const data = (await response.json()) as any;
+        if (data.condition_id) return data.condition_id;
+      }
+    } catch {
+      // Ignore and try fallback
+    }
+
+    // Fallback: Gamma API
+    try {
+      const url = `https://gamma-api.polymarket.com/markets?clob_token_id=${tokenId}`;
+      const response = await this.fetch(url, { method: "GET" });
+
+      if (response.ok) {
+        const data = (await response.json()) as any[];
+        // Gamma returns an array of markets
+        if (Array.isArray(data) && data.length > 0 && data[0].conditionId) {
+           return data[0].conditionId;
+        }
+      }
+    } catch (e) {
+      console.warn(`[API] Failed to fetch market ID for token ${tokenId}: ${e}`);
+    }
+
+    return "";
+  }
+
+  // ===================================
   // HELPER METHODS
   // ===================================
 

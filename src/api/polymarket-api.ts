@@ -21,6 +21,7 @@
 
 import { Agent, fetch as undiciFetch } from "undici";
 import { Position, RawPositionResponse } from "../types";
+import { API_CONFIG, API_URLS, RATE_LIMITS, CACHE_TTL } from "../config";
 
 /**
  * Undici HTTP agent with persistent keep-alive connections.
@@ -28,10 +29,10 @@ import { Position, RawPositionResponse } from "../types";
  * Native Node 22 fetch uses undici internally but doesn't expose connection pool tuning.
  */
 const keepAliveDispatcher = new Agent({
-  keepAliveTimeout: 30_000,      // Keep idle connections alive for 30s
-  keepAliveMaxTimeout: 60_000,   // Max keep-alive duration
-  connections: 10,               // Max concurrent connections per origin
-  pipelining: 1,                 // HTTP pipelining (1 = disabled, safe default)
+  keepAliveTimeout: API_CONFIG.keepAliveTimeout,
+  keepAliveMaxTimeout: API_CONFIG.keepAliveMaxTimeout,
+  connections: API_CONFIG.connections,
+  pipelining: API_CONFIG.pipelining,
 });
 
 // Response types
@@ -147,8 +148,8 @@ export interface PositionWithPrice extends Position {
 }
 
 export class PolymarketAPI {
-  private dataApiUrl = "https://data-api.polymarket.com";
-  private clobApiUrl = "https://clob.polymarket.com";
+  private dataApiUrl = API_URLS.data;
+  private clobApiUrl = API_URLS.clob;
 
   /**
    * Wrapper around fetch that uses the keep-alive agent for persistent connections.
@@ -188,28 +189,28 @@ export class PolymarketAPI {
   //   TP/SL monitor:     ~10 tokens / 5s = ~2.0 req/sec
   //   Background total:  ~7 req/sec out of 150/sec → ~5% usage
   private lastActivityRequestTime = 0;
-  private minActivityRequestInterval = 100; // 10 req/sec for /activity
+  private minActivityRequestInterval = RATE_LIMITS.activityRequestInterval;
 
   private lastPositionsRequestTime = 0;
-  private minPositionsRequestInterval = 67; // 15 req/sec for /positions
+  private minPositionsRequestInterval = RATE_LIMITS.positionsRequestInterval;
 
   private lastClobRequestTime = 0;
-  private minClobRequestInterval = 7; // 150 req/sec for CLOB /price & /book
+  private minClobRequestInterval = RATE_LIMITS.clobRequestInterval;
 
   // Portfolio value cache: address -> cached value
   private portfolioValueCache: Map<string, CachedPortfolioValue> = new Map();
   // Cache TTL in milliseconds (default 30 seconds)
-  private portfolioValueCacheTtlMs: number = 30000;
+  private portfolioValueCacheTtlMs: number = CACHE_TTL.portfolioValue;
 
   // Price cache: "tokenId:side" -> cached price
   private priceCache: Map<string, CachedPrice> = new Map();
   // Price cache TTL in milliseconds (default 5 seconds - prices change frequently)
-  private priceCacheTtlMs: number = 5000;
+  private priceCacheTtlMs: number = CACHE_TTL.price;
 
   // Order book cache: tokenId -> cached order book
   private orderBookCache: Map<string, CachedOrderBook> = new Map();
   // Order book cache TTL in milliseconds (5 seconds, matches price cache)
-  private orderBookCacheTtlMs: number = 5000;
+  private orderBookCacheTtlMs: number = CACHE_TTL.orderBook;
 
   // Tokens whose markets have resolved (no orderbook) — skip them to avoid 404 spam
   private deadTokenIds: Set<string> = new Set();

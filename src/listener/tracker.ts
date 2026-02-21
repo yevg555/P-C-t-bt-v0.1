@@ -2,10 +2,26 @@ import { EventEmitter } from 'eventemitter3';
 import { PublicClient } from 'viem';
 import { CTF_EXCHANGE_ABI, CTF_EXCHANGE_ADDRESS, NEG_RISK_CTF_EXCHANGE_ADDRESS } from './abi';
 import { Trade, PolymarketAPI } from '../api/polymarket-api';
-import { TradeLatency, TradeEvent } from '../polling/activity-poller';
 
-// Re-export TradeEvent for compatibility
-export { TradeEvent };
+/**
+ * Latency metrics for a detected trade
+ */
+export interface TradeLatency {
+  /** Time from trade execution to our detection (ms) */
+  detectionLatencyMs: number;
+  /** Timestamp when trade actually happened on Polymarket */
+  tradeTimestamp: Date;
+  /** Timestamp when we detected the trade */
+  detectedAt: Date;
+}
+
+/**
+ * Trade event with latency info
+ */
+export interface TradeEvent {
+  trade: Trade;
+  latency: TradeLatency;
+}
 
 export interface TrackerConfig {
   traderAddresses: string[];

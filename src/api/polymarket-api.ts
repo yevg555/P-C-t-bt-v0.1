@@ -21,6 +21,7 @@
 
 import { Agent, fetch as undiciFetch } from "undici";
 import { Position, RawPositionResponse } from "../types";
+import { Cache } from "../utils/cache";
 
 /**
  * Undici HTTP agent with persistent keep-alive connections.
@@ -64,30 +65,6 @@ interface PortfolioValueResponseItem {
 }
 
 type PortfolioValueResponse = PortfolioValueResponseItem | PortfolioValueResponseItem[];
-
-/**
- * Cached portfolio value with timestamp
- */
-interface CachedPortfolioValue {
-  value: number;
-  timestamp: number;
-}
-
-/**
- * Cached price with timestamp
- */
-interface CachedPrice {
-  price: number;
-  timestamp: number;
-}
-
-/**
- * Cached order book with timestamp
- */
-interface CachedOrderBook {
-  book: { bids: Array<{ price: string; size: string }>; asks: Array<{ price: string; size: string }> };
-  timestamp: number;
-}
 
 /**
  * Raw trade/activity response from the API
@@ -197,19 +174,16 @@ export class PolymarketAPI {
   private minClobRequestInterval = 7; // 150 req/sec for CLOB /price & /book
 
   // Portfolio value cache: address -> cached value
-  private portfolioValueCache: Map<string, CachedPortfolioValue> = new Map();
-  // Cache TTL in milliseconds (default 30 seconds)
-  private portfolioValueCacheTtlMs: number = 30000;
+  private portfolioValueCache: Cache<number> = new Cache(30000);
 
   // Price cache: "tokenId:side" -> cached price
-  private priceCache: Map<string, CachedPrice> = new Map();
-  // Price cache TTL in milliseconds (default 5 seconds - prices change frequently)
-  private priceCacheTtlMs: number = 5000;
+  private priceCache: Cache<number> = new Cache(5000);
 
   // Order book cache: tokenId -> cached order book
-  private orderBookCache: Map<string, CachedOrderBook> = new Map();
-  // Order book cache TTL in milliseconds (5 seconds, matches price cache)
-  private orderBookCacheTtlMs: number = 5000;
+  private orderBookCache: Cache<{
+    bids: Array<{ price: string; size: string }>;
+    asks: Array<{ price: string; size: string }>;
+  }> = new Cache(5000);
 
   // Tokens whose markets have resolved (no orderbook) — skip them to avoid 404 spam
   private deadTokenIds: Set<string> = new Set();
@@ -276,8 +250,8 @@ export class PolymarketAPI {
     // Check cache first (unless force refresh)
     if (!forceRefresh) {
       const cached = this.portfolioValueCache.get(address);
-      if (cached && Date.now() - cached.timestamp < this.portfolioValueCacheTtlMs) {
-        return cached.value;
+      if (cached !== undefined) {
+        return cached;
       }
     }
 
@@ -314,10 +288,7 @@ export class PolymarketAPI {
       const value = typeof rawValue === "string" ? parseFloat(rawValue) : rawValue;
 
       // Cache the result
-      this.portfolioValueCache.set(address, {
-        value,
-        timestamp: Date.now(),
-      });
+      this.portfolioValueCache.set(address, value);
 
       return value;
     } catch (error) {
@@ -326,10 +297,10 @@ export class PolymarketAPI {
       }
 
       // Return cached value if available (even if stale)
-      const cached = this.portfolioValueCache.get(address);
-      if (cached) {
+      const cached = this.portfolioValueCache.getStale(address);
+      if (cached !== undefined) {
         console.warn(`[API] Using stale cached portfolio value for ${address.slice(0, 10)}...`);
-        return cached.value;
+        return cached;
       }
 
       throw error;
@@ -357,7 +328,7 @@ export class PolymarketAPI {
    * @param ttlMs - Cache TTL in milliseconds
    */
   setPortfolioValueCacheTtl(ttlMs: number): void {
-    this.portfolioValueCacheTtlMs = ttlMs;
+    this.portfolioValueCache.setTtl(ttlMs);
   }
 
   /**
@@ -367,11 +338,7 @@ export class PolymarketAPI {
    * @param address - Wallet address
    */
   getCachedPortfolioValue(address: string): number | undefined {
-    const cached = this.portfolioValueCache.get(address);
-    if (cached && Date.now() - cached.timestamp < this.portfolioValueCacheTtlMs) {
-      return cached.value;
-    }
-    return undefined;
+    return this.portfolioValueCache.get(address);
   }
 
   /**
@@ -533,8 +500,8 @@ export class PolymarketAPI {
     // Check cache first
     if (!skipCache) {
       const cached = this.priceCache.get(cacheKey);
-      if (cached && Date.now() - cached.timestamp < this.priceCacheTtlMs) {
-        return cached.price;
+      if (cached !== undefined) {
+        return cached;
       }
     }
 
@@ -574,10 +541,7 @@ export class PolymarketAPI {
       }
 
       // Cache the result
-      this.priceCache.set(cacheKey, {
-        price,
-        timestamp: Date.now(),
-      });
+      this.priceCache.set(cacheKey, price);
 
       return price;
     } catch (error) {
@@ -587,10 +551,10 @@ export class PolymarketAPI {
       }
 
       // Return cached value as fallback (even if stale)
-      const cached = this.priceCache.get(cacheKey);
-      if (cached) {
+      const cached = this.priceCache.getStale(cacheKey);
+      if (cached !== undefined) {
         console.warn(`[API] Using stale cached price for ${tokenId.slice(0, 10)}...`);
-        return cached.price;
+        return cached;
       }
 
       throw error;
@@ -635,7 +599,7 @@ export class PolymarketAPI {
    * @param ttlMs - Cache TTL in milliseconds
    */
   setPriceCacheTtl(ttlMs: number): void {
-    this.priceCacheTtlMs = ttlMs;
+    this.priceCache.setTtl(ttlMs);
   }
 
   /**
@@ -933,8 +897,8 @@ export class PolymarketAPI {
 
     // Check cache first
     const cached = this.orderBookCache.get(tokenId);
-    if (cached && Date.now() - cached.timestamp < this.orderBookCacheTtlMs) {
-      return cached.book;
+    if (cached !== undefined) {
+      return cached;
     }
 
     await this.respectClobRateLimit();
@@ -963,7 +927,7 @@ export class PolymarketAPI {
     };
 
     // Cache the result
-    this.orderBookCache.set(tokenId, { book, timestamp: Date.now() });
+    this.orderBookCache.set(tokenId, book);
 
     return book;
   }
@@ -973,11 +937,7 @@ export class PolymarketAPI {
    * Returns undefined if not cached or stale
    */
   getCachedOrderBook(tokenId: string): { bids: Array<{ price: string; size: string }>; asks: Array<{ price: string; size: string }> } | undefined {
-    const cached = this.orderBookCache.get(tokenId);
-    if (cached && Date.now() - cached.timestamp < this.orderBookCacheTtlMs) {
-      return cached.book;
-    }
-    return undefined;
+    return this.orderBookCache.get(tokenId);
   }
 
   // ===================================

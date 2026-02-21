@@ -21,6 +21,7 @@ const tests = [
   { name: 'Risk Checker (Market Conditions)', file: 'risk-checker-market.test.ts' },
   { name: 'Copy Size (Depth + Expiration)', file: 'copy-size-depth.test.ts' },
   { name: 'Trade Store (Persistence)', file: 'trade-store.test.ts' },
+  { name: 'Cache Utility', file: 'cache.test.ts' },
 ];
 
 console.log('╔═══════════════════════════════════════════════════╗');
@@ -35,7 +36,7 @@ for (const test of tests) {
   console.log('═'.repeat(50));
   
   try {
-    execSync(`npx ts-node tests/${test.file}`, {
+    execSync(`node node_modules/ts-node/dist/bin.js tests/${test.file}`, {
       cwd: join(__dirname, '..'),
       stdio: 'inherit',
     });

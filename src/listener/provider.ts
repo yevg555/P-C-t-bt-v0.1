@@ -17,7 +17,7 @@ export function createViemClient(rpcUrl: string): PublicClient {
     transport: webSocket(rpcUrl, {
       reconnect: {
         delay: 1000,
-        attempts: 10,
+        attempts: Number.MAX_SAFE_INTEGER, // Infinite reconnects
       },
       timeout: 30000,
     }),

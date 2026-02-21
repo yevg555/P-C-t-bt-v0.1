@@ -145,7 +145,10 @@ class CopyTradingBot {
 
     // Initialize Viem Client and Tracker
     const client = createViemClient(rpcUrl);
-    this.tracker = new Tracker([traderAddress], client);
+    this.tracker = new Tracker({
+      traderAddresses: [traderAddress],
+      copyMakerOrders: process.env.COPY_MAKER_ORDERS === "true",
+    }, client, this.api);
 
     this.sizeCalculator = new CopySizeCalculator({
       sizingMethod:

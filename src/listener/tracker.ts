@@ -1,31 +1,23 @@
 import { EventEmitter } from 'eventemitter3';
 import { PublicClient } from 'viem';
 import { CTF_EXCHANGE_ABI, CTF_EXCHANGE_ADDRESS, NEG_RISK_CTF_EXCHANGE_ADDRESS } from './abi';
-import { Trade } from '../api/polymarket-api';
+import { Trade, PolymarketAPI } from '../api/polymarket-api';
+import { TradeLatency, TradeEvent } from '../polling/activity-poller';
 
-/**
- * Latency metrics for a detected trade
- */
-export interface TradeLatency {
-  /** Time from trade execution to our detection (ms) */
-  detectionLatencyMs: number;
-  /** Timestamp when trade actually happened on Polymarket */
-  tradeTimestamp: Date;
-  /** Timestamp when we detected the trade */
-  detectedAt: Date;
-}
+// Re-export TradeEvent for compatibility
+export { TradeEvent };
 
-/**
- * Trade event with latency info
- */
-export interface TradeEvent {
-  trade: Trade;
-  latency: TradeLatency;
+export interface TrackerConfig {
+  traderAddresses: string[];
+  copyMakerOrders?: boolean;
 }
 
 export class Tracker extends EventEmitter {
   private traderAddresses: Set<string>;
   private client: PublicClient;
+  private api: PolymarketAPI;
+  private copyMakerOrders: boolean;
+
   private unwatchCtf: (() => void) | null = null;
   private unwatchNegRisk: (() => void) | null = null;
 
@@ -34,10 +26,15 @@ export class Tracker extends EventEmitter {
   private tradesDetected = 0;
   private consecutiveErrors = 0;
 
-  constructor(traderAddresses: string[], client: PublicClient) {
+  // Cache for token -> market ID lookup to prevent repeated API calls
+  private marketIdCache: Map<string, string> = new Map();
+
+  constructor(config: TrackerConfig, client: PublicClient, api: PolymarketAPI) {
     super();
-    this.traderAddresses = new Set(traderAddresses.map(a => a.toLowerCase()));
+    this.traderAddresses = new Set(config.traderAddresses.map(a => a.toLowerCase()));
     this.client = client;
+    this.api = api;
+    this.copyMakerOrders = config.copyMakerOrders || false;
   }
 
   async start() {
@@ -45,6 +42,7 @@ export class Tracker extends EventEmitter {
     this.isRunning = true;
 
     console.log('[Tracker] Starting WebSocket listener...');
+    console.log(`[Tracker] Copy Maker Orders: ${this.copyMakerOrders}`);
 
     try {
       // Subscribe to CTF Exchange (Legacy / Binary)
@@ -81,7 +79,9 @@ export class Tracker extends EventEmitter {
   private handleLogs(logs: any[], source: string) {
     // Process logs
     for (const log of logs) {
-       this.processLog(log);
+       this.processLog(log).catch(err => {
+         console.error(`[Tracker] Failed to process log: ${err}`);
+       });
     }
     if (logs.length > 0) {
       this.lastBlock = logs[logs.length-1].blockNumber;
@@ -89,7 +89,7 @@ export class Tracker extends EventEmitter {
     this.consecutiveErrors = 0; // Reset errors on success
   }
 
-  private processLog(log: any) {
+  private async processLog(log: any) {
     const { args, transactionHash } = log;
     const maker = args.maker.toLowerCase();
     const taker = args.taker.toLowerCase();
@@ -97,7 +97,15 @@ export class Tracker extends EventEmitter {
     const isMaker = this.traderAddresses.has(maker);
     const isTaker = this.traderAddresses.has(taker);
 
+    // Filter out unrelated trades
     if (!isMaker && !isTaker) return;
+
+    // Filter Maker orders if configured to skip them
+    // (Maker orders are passive limit orders filled by someone else;
+    // copying them typically results in adverse selection/latency arbitrage against us)
+    if (isMaker && !this.copyMakerOrders) {
+      return;
+    }
 
     this.tradesDetected++;
 
@@ -118,11 +126,6 @@ export class Tracker extends EventEmitter {
     let size: number; // Token amount
     let usdcAmount: number;
 
-    // Logic:
-    // If I am Maker:
-    //   If I give USDC (makerAssetId=0), I am BUYING takerAssetId.
-    //   If I give Token (makerAssetId!=0), I am SELLING makerAssetId.
-
     if (isMaker) {
        if (isMakerUSDC) {
           side = "BUY";
@@ -137,8 +140,6 @@ export class Tracker extends EventEmitter {
        }
     } else {
        // I am Taker
-       // If I give USDC (takerAssetId=0), I am BUYING makerAssetId.
-       // If I give Token (takerAssetId!=0), I am SELLING takerAssetId.
        if (isTakerUSDC) {
           side = "BUY";
           tokenId = makerAssetId.toString();
@@ -152,6 +153,21 @@ export class Tracker extends EventEmitter {
        }
     }
 
+    // Resolve Market ID (Condition ID)
+    // Critical for risk management (MAX_MARKET_SPEND)
+    let marketId = this.marketIdCache.get(tokenId) || "";
+
+    if (!marketId) {
+      try {
+        marketId = await this.api.getMarketId(tokenId);
+        if (marketId) {
+          this.marketIdCache.set(tokenId, marketId);
+        }
+      } catch (err) {
+        console.warn(`[Tracker] Could not fetch market ID for ${tokenId}: ${err}`);
+      }
+    }
+
     // Calculate Price
     const price = size > 0 ? usdcAmount / size : 0;
 
@@ -159,14 +175,14 @@ export class Tracker extends EventEmitter {
     const trade: Trade = {
       id: `${transactionHash}-${args.orderHash}`, // Unique ID
       tokenId,
-      marketId: "", // Market ID not available in OrderFilled event
+      marketId,
       side,
       size,
       price,
       timestamp: new Date(), // Use current time as approximation
       transactionHash,
-      marketTitle: "", // Missing
-      outcome: "" // Missing
+      marketTitle: "", // Still missing title, but marketId helps risk checks
+      outcome: ""
     };
 
     // Latency
@@ -186,8 +202,6 @@ export class Tracker extends EventEmitter {
       // Standardize to float.
       // CTF tokens usually match collateral decimals (USDC = 6) on Polygon.
       // Note: Some docs mention 18 decimals, but standard Gnosis CTF with USDC.e uses 6.
-      // If we encounter 18 decimal tokens, this will be off by 1e12, which is huge.
-      // Ideally we would check decimals on-chain, but for now we assume 6 (USDC).
       return Number(amount) / 1e6;
   }
 
@@ -204,7 +218,7 @@ export class Tracker extends EventEmitter {
        lastBlock: this.lastBlock.toString(),
        consecutiveErrors: this.consecutiveErrors,
        // Dashboard compatibility
-       pollCount: Number(this.lastBlock), // Use last block as "poll count" equivalent
+       pollCount: Number(this.lastBlock),
        changesDetected: this.tradesDetected
     };
   }

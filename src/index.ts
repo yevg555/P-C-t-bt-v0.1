@@ -21,6 +21,7 @@ import { MarketWebSocket } from "./polling/market-websocket";
 import { PolymarketAPI, Trade } from "./api/polymarket-api";
 import { CopySizeCalculator } from "./strategy/copy-size";
 import { RiskChecker, TradingState } from "./strategy/risk-checker";
+import { MarketConditionChecker } from "./strategy/market-condition-checker";
 import { PriceAdjuster } from "./strategy/price-adjuster";
 import { MarketAnalyzer, DEFAULT_MARKET_ANALYSIS_CONFIG } from "./strategy/market-analyzer";
 import { TpSlMonitor, TpSlTriggerEvent } from "./strategy/tp-sl-monitor";
@@ -72,6 +73,7 @@ class CopyTradingBot {
   private api: PolymarketAPI;
   private sizeCalculator: CopySizeCalculator;
   private riskChecker: RiskChecker;
+  private marketConditionChecker: MarketConditionChecker;
   private priceAdjuster: PriceAdjuster;
   private marketAnalyzer: MarketAnalyzer;
   private marketAnalysisConfig: MarketAnalysisConfig;
@@ -220,6 +222,7 @@ class CopyTradingBot {
       depthRangePercent: parseFloat(process.env.DEPTH_RANGE_PERCENT || "0.01"),
       stalePriceThresholdMs: parseInt(process.env.STALE_PRICE_THRESHOLD_MS || "10000"),
     };
+    this.marketConditionChecker = new MarketConditionChecker(this.marketAnalysisConfig);
     this.marketAnalyzer = new MarketAnalyzer(this.marketAnalysisConfig);
 
     // Create executor based on TRADING_MODE
@@ -462,10 +465,7 @@ class CopyTradingBot {
     // STEP 4: MARKET CONDITION RISK CHECK (pre-filter)
     // Reject early if conditions are extreme
     // ================================================
-    const marketRisk = this.riskChecker.checkMarketConditions(
-      snapshot,
-      this.marketAnalysisConfig
-    );
+    const marketRisk = this.marketConditionChecker.check(snapshot);
 
     if (!marketRisk.approved) {
       console.log(`[RISK] MARKET REJECTED: ${marketRisk.reason}`);

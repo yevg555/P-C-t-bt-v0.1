@@ -1,13 +1,13 @@
 /**
- * RISK CHECKER — MARKET CONDITION TESTS
- * ======================================
- * Tests for the new checkMarketConditions() method that gates trades
+ * MARKET CONDITION CHECKER TESTS
+ * ==============================
+ * Tests for the MarketConditionChecker class that gates trades
  * based on spread, divergence, depth, and staleness.
  *
- * Run with: npx ts-node tests/risk-checker-market.test.ts
+ * Run with: npx ts-node tests/market-condition-checker.test.ts
  */
 
-import { RiskChecker } from '../src/strategy/risk-checker';
+import { MarketConditionChecker } from '../src/strategy/market-condition-checker';
 import { MarketSnapshot, MarketAnalysisConfig } from '../src/types';
 import { DEFAULT_MARKET_ANALYSIS_CONFIG } from '../src/strategy/market-analyzer';
 
@@ -56,16 +56,16 @@ const thresholds: MarketAnalysisConfig = {
 };
 
 // ================================================
-console.log('\n🛡️  Testing RiskChecker.checkMarketConditions\n');
+console.log('\n🛡️  Testing MarketConditionChecker\n');
 // ================================================
 
-const checker = new RiskChecker();
+const checker = new MarketConditionChecker(thresholds);
 
 // ----- Normal conditions -----
 
 test('Approves normal market conditions', () => {
   const snap = makeSnapshot({ spreadBps: 100, divergenceBps: 50, condition: 'normal', isVolatile: false });
-  const result = checker.checkMarketConditions(snap, thresholds);
+  const result = checker.check(snap);
 
   assert(result.approved, 'Should approve normal conditions');
   assert(result.riskLevel === 'low', `Risk should be low, got ${result.riskLevel}`);
@@ -75,7 +75,7 @@ test('Approves normal market conditions', () => {
 
 test('Rejects stale market data', () => {
   const snap = makeSnapshot({ condition: 'stale', conditionReasons: ['Empty order book'] });
-  const result = checker.checkMarketConditions(snap, thresholds);
+  const result = checker.check(snap);
 
   assert(!result.approved, 'Should reject stale data');
   assert(result.reason!.includes('stale'), `Reason should mention stale: "${result.reason}"`);
@@ -85,7 +85,7 @@ test('Rejects stale market data', () => {
 
 test('Rejects when spread exceeds maxSpreadBps', () => {
   const snap = makeSnapshot({ spreadBps: 900 }); // > 800 default max
-  const result = checker.checkMarketConditions(snap, thresholds);
+  const result = checker.check(snap);
 
   assert(!result.approved, 'Should reject wide spread');
   assert(result.reason!.includes('Spread too wide'), `Reason: "${result.reason}"`);
@@ -93,7 +93,7 @@ test('Rejects when spread exceeds maxSpreadBps', () => {
 
 test('Approves when spread is just below maxSpreadBps', () => {
   const snap = makeSnapshot({ spreadBps: 790, condition: 'normal', isVolatile: false });
-  const result = checker.checkMarketConditions(snap, thresholds);
+  const result = checker.check(snap);
 
   assert(result.approved, 'Should approve spread just below max');
 });
@@ -102,7 +102,7 @@ test('Approves when spread is just below maxSpreadBps', () => {
 
 test('Rejects when divergence exceeds maxDivergenceBps', () => {
   const snap = makeSnapshot({ divergenceBps: 600, spreadBps: 100 }); // > 500 default max
-  const result = checker.checkMarketConditions(snap, thresholds);
+  const result = checker.check(snap);
 
   assert(!result.approved, 'Should reject high divergence');
   assert(result.reason!.includes('diverged too far'), `Reason: "${result.reason}"`);
@@ -112,7 +112,7 @@ test('Approves when divergence is below maxDivergenceBps', () => {
   const snap = makeSnapshot({
     divergenceBps: 400, spreadBps: 100, condition: 'normal', isVolatile: false,
   });
-  const result = checker.checkMarketConditions(snap, thresholds);
+  const result = checker.check(snap);
 
   assert(result.approved, 'Should approve moderate divergence');
 });
@@ -128,7 +128,7 @@ test('Rejects when depth is below minDepthShares', () => {
     isVolatile: false,
   });
   // minDepthShares = 10 by default
-  const result = checker.checkMarketConditions(snap, thresholds, 50);
+  const result = checker.check(snap, 50);
 
   assert(!result.approved, 'Should reject thin book');
   assert(result.reason!.includes('too thin'), `Reason: "${result.reason}"`);
@@ -142,7 +142,7 @@ test('Approves when depth is above minDepthShares', () => {
     condition: 'normal',
     isVolatile: false,
   });
-  const result = checker.checkMarketConditions(snap, thresholds, 50);
+  const result = checker.check(snap, 50);
 
   assert(result.approved, 'Should approve sufficient depth');
 });
@@ -157,7 +157,7 @@ test('Warns when order size exceeds 50% of depth', () => {
     condition: 'normal',
     isVolatile: false,
   });
-  const result = checker.checkMarketConditions(snap, thresholds, 40); // 40/60 = 67%
+  const result = checker.check(snap, 40); // 40/60 = 67%
 
   assert(result.approved, 'Should approve but warn');
   assert(result.warnings.length > 0, 'Should have warnings');
@@ -172,7 +172,7 @@ test('No slippage warning when order is small relative to depth', () => {
     condition: 'normal',
     isVolatile: false,
   });
-  const result = checker.checkMarketConditions(snap, thresholds, 10); // 10/200 = 5%
+  const result = checker.check(snap, 10); // 10/200 = 5%
 
   assert(result.warnings.every(w => !w.includes('slippage')), 'Should NOT warn about slippage');
 });
@@ -186,7 +186,7 @@ test('Warns when spread exceeds wideSpreadThreshold but below max', () => {
     isVolatile: false,
   }); // 500 > 200 threshold, < 800 max
 
-  const result = checker.checkMarketConditions(snap, thresholds);
+  const result = checker.check(snap);
 
   assert(result.approved, 'Should approve but warn');
   assert(result.warnings.some(w => w.includes('Wide spread')), 'Should warn about wide spread');
@@ -201,7 +201,7 @@ test('Warns when divergence exceeds 60% of max', () => {
     condition: 'normal',
     isVolatile: false,
   });
-  const result = checker.checkMarketConditions(snap, thresholds);
+  const result = checker.check(snap);
 
   assert(result.approved, 'Should approve but warn');
   assert(result.warnings.some(w => w.includes('divergence')), 'Should warn about divergence');
@@ -215,7 +215,7 @@ test('Risk level is high when snapshot is volatile', () => {
     isVolatile: true,
     condition: 'wide_spread',
   });
-  const result = checker.checkMarketConditions(snap, thresholds);
+  const result = checker.check(snap);
 
   assert(result.approved, 'Should approve (below max)');
   assert(result.riskLevel === 'high', `Risk should be high, got ${result.riskLevel}`);
@@ -228,7 +228,7 @@ test('Risk level is medium with one warning', () => {
     isVolatile: false,
     condition: 'normal',
   });
-  const result = checker.checkMarketConditions(snap, thresholds);
+  const result = checker.check(snap);
 
   assert(result.approved, 'Should approve');
   assert(result.riskLevel === 'medium', `Risk should be medium, got ${result.riskLevel}`);
@@ -246,7 +246,9 @@ test('Custom thresholds are respected', () => {
 
   // This would pass default thresholds but fail strict ones
   const snap = makeSnapshot({ spreadBps: 300, condition: 'normal' });
-  const result = checker.checkMarketConditions(snap, strictThresholds);
+  // Instantiate new checker with strict thresholds
+  const strictChecker = new MarketConditionChecker(strictThresholds);
+  const result = strictChecker.check(snap);
 
   assert(!result.approved, 'Should reject with strict thresholds');
 });
@@ -262,7 +264,7 @@ test('Skips depth check when no order size provided', () => {
     isVolatile: false,
   });
   // No orderSize parameter → depth check not run
-  const result = checker.checkMarketConditions(snap, thresholds);
+  const result = checker.check(snap);
 
   assert(result.approved, 'Should approve without depth check');
 });
@@ -276,5 +278,5 @@ if (failed > 0) {
   console.log('\n❌ Some tests failed!\n');
   process.exit(1);
 } else {
-  console.log('\n🎉 All RiskChecker market condition tests passed!\n');
+  console.log('\n🎉 All MarketConditionChecker tests passed!\n');
 }

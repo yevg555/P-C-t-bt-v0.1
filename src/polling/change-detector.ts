@@ -38,17 +38,33 @@ export class ChangeDetector {
    *   console.log(`${change.side} ${change.delta} of ${change.tokenId}`);
    * }
    */
-  detectChanges(previous: Position[], current: Position[]): PositionChange[] {
+  detectChanges(
+    previous: Position[] | ReadonlyMap<string, Position>,
+    current: Position[] | ReadonlyMap<string, Position>
+  ): PositionChange[] {
     const changes: PositionChange[] = [];
     const now = new Date();
 
-    // Build lookup maps — reuse if input is small, otherwise create fresh
-    const prevMap = previous.length <= 1 && previous.length > 0
-      ? new Map([[previous[0].tokenId, previous[0]]])
-      : new Map(previous.map(p => [p.tokenId, p]));
-    const currMap = current.length <= 1 && current.length > 0
-      ? new Map([[current[0].tokenId, current[0]]])
-      : new Map(current.map(p => [p.tokenId, p]));
+    // Build lookup maps — reuse if input is already a Map, otherwise create fresh
+    let prevMap: ReadonlyMap<string, Position>;
+    if (previous instanceof Map) {
+      prevMap = previous;
+    } else {
+      const prevArr = previous as Position[];
+      prevMap = prevArr.length <= 1 && prevArr.length > 0
+        ? new Map([[prevArr[0].tokenId, prevArr[0]]])
+        : new Map(prevArr.map(p => [p.tokenId, p]));
+    }
+
+    let currMap: ReadonlyMap<string, Position>;
+    if (current instanceof Map) {
+      currMap = current;
+    } else {
+      const currArr = current as Position[];
+      currMap = currArr.length <= 1 && currArr.length > 0
+        ? new Map([[currArr[0].tokenId, currArr[0]]])
+        : new Map(currArr.map(p => [p.tokenId, p]));
+    }
     
     // === Check CURRENT positions against PREVIOUS ===
     for (const [tokenId, currPos] of currMap) {

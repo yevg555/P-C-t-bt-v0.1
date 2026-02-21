@@ -34,7 +34,7 @@ import {
   PaperPosition,
   SpendTracker,
 } from "../types";
-import { withRetry, CircuitBreaker, checkSlippage } from "../utils";
+import { withRetry, CircuitBreaker, checkSlippage, logger } from "../utils";
 
 /**
  * Configuration for live trading
@@ -115,8 +115,8 @@ export class LiveTradingExecutor implements OrderExecutor {
 
     this.wallet = new Wallet(privateKey);
     const signerAddress = await this.wallet.getAddress();
-    console.log(`[LIVE] Signer address: ${signerAddress}`);
-    console.log(`[LIVE] Funder address: ${this.config.funderAddress}`);
+    logger.info(`[LIVE] Signer address: ${signerAddress}`);
+    logger.info(`[LIVE] Funder address: ${this.config.funderAddress}`);
 
     // Map signature type number to enum
     const sigType = this.config.signatureType as SignatureType;
@@ -131,18 +131,19 @@ export class LiveTradingExecutor implements OrderExecutor {
         secret: this.config.apiSecret,
         passphrase: this.config.apiPassphrase,
       };
-      console.log("[LIVE] Using pre-configured API credentials");
+      logger.info("[LIVE] Using pre-configured API credentials");
     } else {
       // Auto-derive credentials from private key
-      console.log("[LIVE] Deriving API credentials from private key...");
+      logger.info("[LIVE] Deriving API credentials from private key...");
       const tempClient = new ClobClient(clobApiUrl, chainId, this.wallet);
       try {
         creds = await tempClient.createOrDeriveApiKey();
-        console.log("[LIVE] API credentials derived successfully");
+        logger.info("[LIVE] API credentials derived successfully");
       } catch (error) {
         throw new Error(
           `Failed to derive API credentials: ${error instanceof Error ? error.message : String(error)}. ` +
-          `Make sure your private key is correct and has interacted with Polymarket.`
+          `Make sure your private key is correct and has interacted with Polymarket.`,
+          { cause: error }
         );
       }
     }
@@ -160,10 +161,11 @@ export class LiveTradingExecutor implements OrderExecutor {
     // Step 4: Verify connectivity
     try {
       await this.client.getOk();
-      console.log("[LIVE] CLOB API connection verified");
+      logger.info("[LIVE] CLOB API connection verified");
     } catch (error) {
       throw new Error(
-        `CLOB API connectivity check failed: ${error instanceof Error ? error.message : String(error)}`
+        `CLOB API connectivity check failed: ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error }
       );
     }
 
@@ -175,28 +177,28 @@ export class LiveTradingExecutor implements OrderExecutor {
       const balance = parseFloat(balanceAllowance.balance) / 1e6; // USDC has 6 decimals
       const allowance = parseFloat(balanceAllowance.allowance) / 1e6;
 
-      console.log(`[LIVE] USDC Balance: $${balance.toFixed(2)}`);
-      console.log(`[LIVE] USDC Allowance: $${allowance.toFixed(2)}`);
+      logger.info(`[LIVE] USDC Balance: $${balance.toFixed(2)}`);
+      logger.info(`[LIVE] USDC Allowance: $${allowance.toFixed(2)}`);
 
       if (balance <= 0) {
-        console.warn("[LIVE] WARNING: Zero USDC balance — you won't be able to place BUY orders");
+        logger.warn("[LIVE] WARNING: Zero USDC balance — you won't be able to place BUY orders");
       }
       if (allowance <= 0) {
-        console.warn("[LIVE] WARNING: Zero USDC allowance — run updateBalanceAllowance() or approve on-chain");
+        logger.warn("[LIVE] WARNING: Zero USDC allowance — run updateBalanceAllowance() or approve on-chain");
         // Try to update allowance automatically
         try {
           await this.client.updateBalanceAllowance({ asset_type: AssetType.COLLATERAL });
-          console.log("[LIVE] Allowance refreshed successfully");
+          logger.info("[LIVE] Allowance refreshed successfully");
         } catch {
-          console.warn("[LIVE] Could not auto-refresh allowance — you may need to approve on-chain");
+          logger.warn("[LIVE] Could not auto-refresh allowance — you may need to approve on-chain");
         }
       }
     } catch (error) {
-      console.warn(`[LIVE] Could not check balance/allowance: ${error instanceof Error ? error.message : String(error)}`);
+      logger.warn(`[LIVE] Could not check balance/allowance: ${error instanceof Error ? error.message : String(error)}`);
     }
 
     this.isInitialized = true;
-    console.log("[LIVE] Live executor initialized and ready");
+    logger.info("[LIVE] Live executor initialized and ready");
   }
 
   /**
@@ -210,7 +212,7 @@ export class LiveTradingExecutor implements OrderExecutor {
 
     // Circuit breaker check
     if (!this.circuitBreaker.allowRequest()) {
-      console.error(`[LIVE] Circuit breaker OPEN — rejecting order (${this.circuitBreaker.getFailures()} consecutive failures)`);
+      logger.error(`[LIVE] Circuit breaker OPEN — rejecting order (${this.circuitBreaker.getFailures()} consecutive failures)`);
       return {
         orderId,
         status: "failed",
@@ -227,7 +229,7 @@ export class LiveTradingExecutor implements OrderExecutor {
       const side = order.side === "BUY" ? ClobSide.BUY : ClobSide.SELL;
       const isMarketOrder = order.orderType === "market";
 
-      console.log(`[LIVE] Submitting ${isMarketOrder ? "MARKET" : "LIMIT"} ${order.side} order: ${order.size} shares @ $${order.price.toFixed(4)}`);
+      logger.info(`[LIVE] Submitting ${isMarketOrder ? "MARKET" : "LIMIT"} ${order.side} order: ${order.size} shares @ $${order.price.toFixed(4)}`);
 
       // Submit order with retry on transient failures
       const maxRetries = this.config.maxRetries ?? 3;
@@ -279,13 +281,13 @@ export class LiveTradingExecutor implements OrderExecutor {
 
       // Parse response
       const executedAt = new Date();
-      console.log(`[LIVE] Order response:`, JSON.stringify(response, null, 2));
+      logger.info(`[LIVE] Order response:`, JSON.stringify(response, null, 2));
 
       if (!response || !response.success) {
         // Record failure BEFORE returning — structured API rejections must count
         this.circuitBreaker.recordFailure();
         const errorMsg = response?.errorMsg || "Unknown error from CLOB API";
-        console.error(`[LIVE] Order rejected: ${errorMsg}`);
+        logger.error(`[LIVE] Order rejected: ${errorMsg}`);
         return {
           orderId,
           status: "failed",
@@ -312,7 +314,7 @@ export class LiveTradingExecutor implements OrderExecutor {
         // Slippage check for immediate fills
         const slippage = checkSlippage(order.side, order.price, fillPrice, this.config.maxSlippageBps ?? 200);
         if (!slippage.acceptable) {
-          console.warn(`[LIVE] ${slippage.description}`);
+          logger.warn(`[LIVE] ${slippage.description}`);
           // Log warning but don't reject — the fill already happened on-chain
         }
 
@@ -332,7 +334,7 @@ export class LiveTradingExecutor implements OrderExecutor {
 
       if (status === "live" || status === "delayed" || status === "unmatched") {
         // Order is resting on the book — poll for fill
-        console.log(`[LIVE] Order ${clobOrderId} is ${status}, polling for fill...`);
+        logger.info(`[LIVE] Order ${clobOrderId} is ${status}, polling for fill...`);
         return await this.pollOrderStatus(clobOrderId, order, placedAt);
       }
 
@@ -349,7 +351,7 @@ export class LiveTradingExecutor implements OrderExecutor {
     } catch (error) {
       this.circuitBreaker.recordFailure();
       const errorMsg = error instanceof Error ? error.message : String(error);
-      console.error(`[LIVE] Order execution failed: ${errorMsg} (circuit breaker: ${this.circuitBreaker.getState()})`);
+      logger.error(`[LIVE] Order execution failed: ${errorMsg} (circuit breaker: ${this.circuitBreaker.getState()})`);
 
       return {
         orderId,
@@ -397,7 +399,7 @@ export class LiveTradingExecutor implements OrderExecutor {
           // Fully filled — check slippage
           const slippage = checkSlippage(originalOrder.side, originalOrder.price, price, this.config.maxSlippageBps ?? 200);
           if (!slippage.acceptable) {
-            console.warn(`[LIVE] ${slippage.description}`);
+            logger.warn(`[LIVE] ${slippage.description}`);
           }
           this.trackPosition(originalOrder, sizeMatched, price);
 
@@ -415,7 +417,7 @@ export class LiveTradingExecutor implements OrderExecutor {
 
         if (sizeMatched > 0 && sizeMatched < originalSize) {
           // Partially filled — keep polling until full or timeout
-          console.log(`[LIVE] Partial fill: ${sizeMatched}/${originalSize} shares`);
+          logger.info(`[LIVE] Partial fill: ${sizeMatched}/${originalSize} shares`);
           continue;
         }
 
@@ -432,17 +434,17 @@ export class LiveTradingExecutor implements OrderExecutor {
           };
         }
       } catch (error) {
-        console.warn(`[LIVE] Status poll error: ${error instanceof Error ? error.message : String(error)}`);
+        logger.warn(`[LIVE] Status poll error: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
 
     // Timeout — cancel the order and return partial result
-    console.log(`[LIVE] Order ${clobOrderId} timed out after ${timeoutMs / 1000}s, cancelling...`);
+    logger.info(`[LIVE] Order ${clobOrderId} timed out after ${timeoutMs / 1000}s, cancelling...`);
     try {
       await this.client!.cancelOrder({ orderID: clobOrderId });
-      console.log(`[LIVE] Order ${clobOrderId} cancelled`);
+      logger.info(`[LIVE] Order ${clobOrderId} cancelled`);
     } catch (error) {
-      console.warn(`[LIVE] Failed to cancel order: ${error instanceof Error ? error.message : String(error)}`);
+      logger.warn(`[LIVE] Failed to cancel order: ${error instanceof Error ? error.message : String(error)}`);
     }
 
     // Check final status after cancel
@@ -582,10 +584,10 @@ export class LiveTradingExecutor implements OrderExecutor {
     } catch (error) {
       // Return cached value as fallback if available
       if (this.cachedBalance !== null) {
-        console.warn(`[LIVE] getBalance failed, using cached value: $${this.cachedBalance.toFixed(2)}`);
+        logger.warn(`[LIVE] getBalance failed, using cached value: $${this.cachedBalance.toFixed(2)}`);
         return this.cachedBalance;
       }
-      console.error(`[LIVE] getBalance failed: ${error instanceof Error ? error.message : String(error)}`);
+      logger.error(`[LIVE] getBalance failed: ${error instanceof Error ? error.message : String(error)}`);
       throw error;
     }
   }
@@ -661,9 +663,9 @@ export class LiveTradingExecutor implements OrderExecutor {
     this.ensureInitialized();
     try {
       await this.client!.cancelAll();
-      console.log("[LIVE] All open orders cancelled");
+      logger.info("[LIVE] All open orders cancelled");
     } catch (error) {
-      console.error(`[LIVE] cancelAll failed: ${error instanceof Error ? error.message : String(error)}`);
+      logger.error(`[LIVE] cancelAll failed: ${error instanceof Error ? error.message : String(error)}`);
       throw error;
     }
   }
@@ -677,19 +679,19 @@ export class LiveTradingExecutor implements OrderExecutor {
     const positionEntries = Array.from(this.positions.entries());
 
     if (positionEntries.length === 0) {
-      console.log("[LIVE] No positions to sell");
+      logger.info("[LIVE] No positions to sell");
       return results;
     }
 
-    console.log(`\n${"!".repeat(50)}`);
-    console.log("!!! 1-CLICK SELL ACTIVATED - SELLING ALL POSITIONS !!!");
-    console.log(`${"!".repeat(50)}\n`);
+    logger.info(`\n${"!".repeat(50)}`);
+    logger.info("!!! 1-CLICK SELL ACTIVATED - SELLING ALL POSITIONS !!!");
+    logger.info(`${"!".repeat(50)}\n`);
 
     // Cancel all open orders first
     try {
       await this.cancelAllOrders();
     } catch {
-      console.warn("[LIVE] Could not cancel open orders before sell-all");
+      logger.warn("[LIVE] Could not cancel open orders before sell-all");
     }
 
     for (const [tokenId, position] of positionEntries) {
@@ -707,7 +709,7 @@ export class LiveTradingExecutor implements OrderExecutor {
         const result = await this.execute(order);
         results.push(result);
       } catch (error) {
-        console.error(`[LIVE] Failed to sell ${tokenId}: ${error}`);
+        logger.error(`[LIVE] Failed to sell ${tokenId}: ${error}`);
         results.push({
           orderId: `FAILED-${tokenId}`,
           status: "failed",
@@ -719,7 +721,7 @@ export class LiveTradingExecutor implements OrderExecutor {
       }
     }
 
-    console.log(`\n[LIVE] 1-Click Sell Complete: ${results.filter(r => r.status === "filled").length}/${positionEntries.length} positions closed\n`);
+    logger.info(`\n[LIVE] 1-Click Sell Complete: ${results.filter(r => r.status === "filled").length}/${positionEntries.length} positions closed\n`);
     return results;
   }
 

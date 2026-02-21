@@ -8,7 +8,7 @@
  * Rate-limits per-channel to avoid flooding.
  */
 
-import { Agent, fetch as undiciFetch } from "undici";
+import { Agent, fetch as undiciFetch, Dispatcher } from "undici";
 
 /** Keep-alive dispatcher for alert HTTP connections (~20-50ms savings per request) */
 const alertDispatcher = new Agent({
@@ -59,10 +59,14 @@ export class AlertService {
   private telegramRateLimit: RateLimitState = { lastSentAt: 0, count: 0, windowStart: 0 };
   private discordRateLimit: RateLimitState = { lastSentAt: 0, count: 0, windowStart: 0 };
   private minSeverityLevel: number;
+  private dispatcher: Dispatcher;
+  private timeProvider: () => number;
 
-  constructor(config: AlertConfig) {
+  constructor(config: AlertConfig, dispatcher?: Dispatcher, timeProvider: () => number = Date.now) {
     this.config = config;
     this.minSeverityLevel = SEVERITY_ORDER[config.minSeverity || "high"];
+    this.dispatcher = dispatcher || alertDispatcher;
+    this.timeProvider = timeProvider;
   }
 
   get enabled(): boolean {
@@ -85,7 +89,7 @@ export class AlertService {
     if (!this.enabled) return;
 
     const emoji = SEVERITY_EMOJI[severity];
-    const now = Date.now();
+    const now = this.timeProvider();
 
     const promises: Promise<void>[] = [];
 
@@ -164,7 +168,7 @@ export class AlertService {
           parse_mode: "HTML",
           disable_notification: false,
         }),
-        dispatcher: alertDispatcher,
+        dispatcher: this.dispatcher,
       });
       if (!res.ok) {
         console.warn(`[ALERT] Telegram send failed: ${res.status} ${res.statusText}`);
@@ -195,7 +199,7 @@ export class AlertService {
             footer: { text: "Copy Trading Bot" },
           }],
         }),
-        dispatcher: alertDispatcher,
+        dispatcher: this.dispatcher,
       });
       if (!res.ok) {
         console.warn(`[ALERT] Discord send failed: ${res.status} ${res.statusText}`);

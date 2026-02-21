@@ -9,6 +9,8 @@
 import { execSync } from 'child_process';
 import { join } from 'path';
 
+const tsNodePath = require.resolve('ts-node/dist/bin.js');
+
 const tests = [
   { name: 'Position Cache', file: 'position-cache.test.ts' },
   { name: 'Change Detector', file: 'change-detector.test.ts' },
@@ -21,6 +23,7 @@ const tests = [
   { name: 'Risk Checker (Market Conditions)', file: 'risk-checker-market.test.ts' },
   { name: 'Copy Size (Depth + Expiration)', file: 'copy-size-depth.test.ts' },
   { name: 'Trade Store (Persistence)', file: 'trade-store.test.ts' },
+  { name: 'Alert Service', file: 'alert-service.test.ts' },
 ];
 
 console.log('╔═══════════════════════════════════════════════════╗');
@@ -35,7 +38,7 @@ for (const test of tests) {
   console.log('═'.repeat(50));
   
   try {
-    execSync(`npx ts-node tests/${test.file}`, {
+    execSync(`node "${tsNodePath}" tests/${test.file}`, {
       cwd: join(__dirname, '..'),
       stdio: 'inherit',
     });

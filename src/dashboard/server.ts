@@ -22,8 +22,9 @@
  */
 
 import express from "express";
-import { createServer, Server as HttpServer } from "http";
+import { createServer, Server as HttpServer, IncomingMessage } from "http";
 import { WebSocketServer, WebSocket } from "ws";
+import * as crypto from "crypto";
 import * as path from "path";
 import * as fs from "fs";
 import { TradeStore, TradeQuery } from "../storage";
@@ -65,13 +66,67 @@ export class DashboardServer {
 
     this.app = express();
     this.httpServer = createServer(this.app);
-    this.wss = new WebSocketServer({ server: this.httpServer });
+    this.wss = new WebSocketServer({ noServer: true });
 
     this.setupRoutes();
     this.setupWebSocket();
   }
 
+  private checkAuth(req: IncomingMessage): boolean {
+    const username = process.env.DASHBOARD_USERNAME;
+    const password = process.env.DASHBOARD_PASSWORD;
+
+    if (!username || !password) return true;
+
+    const auth = req.headers["authorization"];
+    if (!auth) return false;
+
+    const [scheme, credentials] = auth.split(" ");
+    if (scheme !== "Basic" || !credentials) return false;
+
+    let decoded: string;
+    try {
+      decoded = Buffer.from(credentials, "base64").toString();
+    } catch {
+      return false;
+    }
+
+    const [u, ...pParts] = decoded.split(":");
+    const p = pParts.join(":");
+
+    try {
+      const uBuffer = Buffer.from(u || "");
+      const pBuffer = Buffer.from(p || "");
+      const expectedU = Buffer.from(username);
+      const expectedP = Buffer.from(password);
+
+      if (
+        uBuffer.length !== expectedU.length ||
+        pBuffer.length !== expectedP.length
+      ) {
+        return false;
+      }
+
+      return (
+        crypto.timingSafeEqual(uBuffer, expectedU) &&
+        crypto.timingSafeEqual(pBuffer, expectedP)
+      );
+    } catch {
+      return false;
+    }
+  }
+
   private setupRoutes(): void {
+    // Basic Auth Middleware
+    this.app.use((req, res, next) => {
+      if (this.checkAuth(req)) {
+        next();
+      } else {
+        res.set("WWW-Authenticate", 'Basic realm="Dashboard"');
+        res.status(401).send("Authentication required.");
+      }
+    });
+
     // Serve the dashboard HTML
     this.app.get("/", (_req, res) => {
       const htmlPath = path.join(__dirname, "index.html");
@@ -228,6 +283,17 @@ export class DashboardServer {
   }
 
   private setupWebSocket(): void {
+    this.httpServer.on("upgrade", (request, socket, head) => {
+      if (this.checkAuth(request)) {
+        this.wss.handleUpgrade(request, socket, head, (ws) => {
+          this.wss.emit("connection", ws, request);
+        });
+      } else {
+        socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+        socket.destroy();
+      }
+    });
+
     this.wss.on("connection", (ws) => {
       // Send initial state immediately on connect
       this.sendStatsToClient(ws);

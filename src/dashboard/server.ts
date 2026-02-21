@@ -22,6 +22,7 @@
  */
 
 import express from "express";
+import helmet from "helmet";
 import { createServer, Server as HttpServer } from "http";
 import { WebSocketServer, WebSocket } from "ws";
 import * as path from "path";
@@ -64,6 +65,21 @@ export class DashboardServer {
     this.port = port;
 
     this.app = express();
+
+    // Secure the app with Helmet
+    this.app.use(
+      helmet({
+        contentSecurityPolicy: {
+          directives: {
+            ...helmet.contentSecurityPolicy.getDefaultDirectives(),
+            "script-src": ["'self'", "'unsafe-inline'"],
+            "style-src": ["'self'", "'unsafe-inline'"],
+            "connect-src": ["'self'", "ws:", "wss:"],
+          },
+        },
+      })
+    );
+
     this.httpServer = createServer(this.app);
     this.wss = new WebSocketServer({ server: this.httpServer });
 

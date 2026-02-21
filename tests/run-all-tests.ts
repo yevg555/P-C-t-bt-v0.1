@@ -18,6 +18,7 @@ const tests = [
   { name: 'Activity Poller', file: 'activity-poller.test.ts' },
   { name: 'Market Analyzer', file: 'market-analyzer.test.ts' },
   { name: 'Price Adjuster (Adaptive)', file: 'price-adjuster.test.ts' },
+  { name: 'Risk Checker (Core)', file: 'risk-checker.test.ts' },
   { name: 'Risk Checker (Market Conditions)', file: 'risk-checker-market.test.ts' },
   { name: 'Copy Size (Depth + Expiration)', file: 'copy-size-depth.test.ts' },
   { name: 'Trade Store (Persistence)', file: 'trade-store.test.ts' },

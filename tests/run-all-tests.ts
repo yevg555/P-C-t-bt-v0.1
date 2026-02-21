@@ -21,6 +21,7 @@ const tests = [
   { name: 'Risk Checker (Market Conditions)', file: 'risk-checker-market.test.ts' },
   { name: 'Copy Size (Depth + Expiration)', file: 'copy-size-depth.test.ts' },
   { name: 'Trade Store (Persistence)', file: 'trade-store.test.ts' },
+  { name: 'Dashboard Auth', file: 'dashboard-auth.test.ts' },
 ];
 
 console.log('╔═══════════════════════════════════════════════════╗');

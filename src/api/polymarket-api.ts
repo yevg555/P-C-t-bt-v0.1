@@ -52,6 +52,12 @@ interface OrderBookResponse {
   asks?: Array<{ price: string; size: string }>;
 }
 
+interface GammaMarketResponse {
+  conditionId?: string;
+  question?: string;
+  slug?: string;
+}
+
 /**
  * Portfolio value response from the API
  * Can be either an array or single object
@@ -149,12 +155,13 @@ export interface PositionWithPrice extends Position {
 export class PolymarketAPI {
   private dataApiUrl = "https://data-api.polymarket.com";
   private clobApiUrl = "https://clob.polymarket.com";
+  private gammaApiUrl = "https://gamma-api.polymarket.com";
 
   /**
    * Wrapper around fetch that uses the keep-alive agent for persistent connections.
    * Saves ~20-50ms per request by reusing TCP connections.
    */
-  private async fetch(url: string, init?: RequestInit): Promise<Response> {
+  protected async fetch(url: string, init?: RequestInit): Promise<Response> {
     const response = await undiciFetch(url, {
       method: init?.method,
       headers: init?.headers as Record<string, string> | undefined,
@@ -213,6 +220,9 @@ export class PolymarketAPI {
 
   // Tokens whose markets have resolved (no orderbook) — skip them to avoid 404 spam
   private deadTokenIds: Set<string> = new Set();
+
+  // Cache for tokenId -> marketId (conditionId) mapping
+  private marketIdCache: Map<string, string> = new Map();
 
   // ===================================
   // POSITIONS (Data API)
@@ -392,6 +402,7 @@ export class PolymarketAPI {
    * @param options - Query options
    * @param options.limit - Max number of trades to return (default 100)
    * @param options.after - Unix timestamp (seconds) - only return trades after this time
+   * @param options.market - Market ID (condition ID) to filter by
    * @returns Array of trades, most recent first
    *
    * @example
@@ -404,17 +415,22 @@ export class PolymarketAPI {
    */
   async getTrades(
     address: string,
-    options: { limit?: number; after?: number } = {}
+    options: { limit?: number; after?: number; market?: string } = {}
   ): Promise<Trade[]> {
     await this.respectActivityRateLimit();
 
-    const { limit = 100, after } = options;
+    const { limit = 100, after, market } = options;
 
     let url = `${this.dataApiUrl}/activity?user=${address}&limit=${limit}`;
 
     // Add 'after' parameter for incremental fetching
     if (after !== undefined) {
       url += `&after=${after}`;
+    }
+
+    // Add 'market' parameter for server-side filtering
+    if (market) {
+      url += `&market=${market}`;
     }
 
     try {
@@ -453,8 +469,51 @@ export class PolymarketAPI {
     options: { limit?: number; after?: number } = {}
   ): Promise<Trade[]> {
     const { limit = 50, after } = options;
+
+    // Try to get marketId (conditionId) for efficient filtering
+    const marketId = await this.getMarketIdFromTokenId(tokenId);
+
+    if (marketId) {
+      // Filter server-side by marketId
+      // Still need to filter by tokenId client-side as a market has multiple tokens
+      const allTrades = await this.getTrades(address, { limit: limit * 2, after, market: marketId });
+      return allTrades.filter((t) => t.tokenId === tokenId).slice(0, limit);
+    }
+
+    // Fallback: fetch all and filter client-side
     const allTrades = await this.getTrades(address, { limit: limit * 2, after });
     return allTrades.filter((t) => t.tokenId === tokenId).slice(0, limit);
+  }
+
+  /**
+   * Look up market ID (condition ID) for a token ID
+   * Uses caching to avoid repeated API calls
+   */
+  async getMarketIdFromTokenId(tokenId: string): Promise<string | null> {
+    if (this.marketIdCache.has(tokenId)) {
+      return this.marketIdCache.get(tokenId)!;
+    }
+
+    try {
+      const url = `${this.gammaApiUrl}/markets?clob_token_ids=${tokenId}`;
+      const response = await this.fetch(url, { method: "GET" });
+
+      if (!response.ok) {
+        return null;
+      }
+
+      const markets = (await response.json()) as GammaMarketResponse[];
+      if (markets && markets.length > 0 && markets[0].conditionId) {
+        const marketId = markets[0].conditionId;
+        this.marketIdCache.set(tokenId, marketId);
+        return marketId;
+      }
+
+      return null;
+    } catch (error) {
+      console.warn(`[API] Failed to look up market ID for token ${tokenId}:`, error);
+      return null;
+    }
   }
 
   /**

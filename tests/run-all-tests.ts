@@ -13,6 +13,7 @@ const tests = [
   { name: 'Position Cache', file: 'position-cache.test.ts' },
   { name: 'Change Detector', file: 'change-detector.test.ts' },
   { name: 'Copy Size Calculator', file: 'copy-size.test.ts' },
+  { name: 'Executor Factory', file: 'executor-factory.test.ts' },
   { name: 'Paper Trading Executor', file: 'paper-executor.test.ts' },
   { name: 'TP/SL Monitor', file: 'tp-sl-monitor.test.ts' },
   { name: 'Activity Poller', file: 'activity-poller.test.ts' },
@@ -35,7 +36,7 @@ for (const test of tests) {
   console.log('═'.repeat(50));
   
   try {
-    execSync(`npx ts-node tests/${test.file}`, {
+    execSync(`node node_modules/ts-node/dist/bin.js tests/${test.file}`, {
       cwd: join(__dirname, '..'),
       stdio: 'inherit',
     });

@@ -11,11 +11,21 @@
  * You listen to these events and respond (copy the trade!)
  * 
  * @example
+ * import { createExecutor } from '../execution';
+ *
  * const poller = new PositionPoller({ traderAddress: '0x...', intervalMs: 200 });
+ * const executor = createExecutor();
  * 
- * poller.on('change', (change) => {
+ * poller.on('change', async (change) => {
  *   console.log(`Trader ${change.side} ${change.delta} shares!`);
- *   // TODO: Copy the trade!
+ *
+ *   // Copy the trade using the executor
+ *   await executor.execute({
+ *     tokenId: change.tokenId,
+ *     side: change.side,
+ *     size: change.delta,
+ *     price: change.curPrice || 0.5, // Use current price or strategy
+ *   });
  * });
  * 
  * await poller.start();

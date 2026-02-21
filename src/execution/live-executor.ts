@@ -224,129 +224,17 @@ export class LiveTradingExecutor implements OrderExecutor {
     }
 
     try {
-      const side = order.side === "BUY" ? ClobSide.BUY : ClobSide.SELL;
       const isMarketOrder = order.orderType === "market";
-
       console.log(`[LIVE] Submitting ${isMarketOrder ? "MARKET" : "LIMIT"} ${order.side} order: ${order.size} shares @ $${order.price.toFixed(4)}`);
 
-      // Submit order with retry on transient failures
-      const maxRetries = this.config.maxRetries ?? 3;
-      let response: any;
+      // 1. Submit order
+      const response = await this.submitOrder(order);
 
-      if (isMarketOrder) {
-        response = await withRetry(
-          () => this.client!.createAndPostMarketOrder(
-            {
-              tokenID: order.tokenId,
-              price: order.price,
-              amount: order.side === "BUY"
-                ? order.size * order.price
-                : order.size,
-              side,
-            },
-            undefined,
-            ClobOrderType.FOK,
-          ),
-          { maxRetries },
-        );
-      } else {
-        const orderType = order.expiresInMs && order.expiresInMs > 0
-          ? ClobOrderType.GTD
-          : ClobOrderType.GTC;
+      // 2. Handle response (success or failure)
+      return await this.handleOrderSubmission(response, order, orderId, placedAt);
 
-        const userOrder: any = {
-          tokenID: order.tokenId,
-          price: order.price,
-          size: order.size,
-          side,
-        };
-
-        if (orderType === ClobOrderType.GTD && order.expiresInMs) {
-          const minExpiration = Math.floor(Date.now() / 1000) + 60;
-          const requestedExpiration = Math.floor((Date.now() + order.expiresInMs) / 1000);
-          userOrder.expiration = Math.max(requestedExpiration, minExpiration);
-        }
-
-        response = await withRetry(
-          () => this.client!.createAndPostOrder(
-            userOrder,
-            undefined,
-            orderType,
-          ),
-          { maxRetries },
-        );
-      }
-
-      // Parse response
-      const executedAt = new Date();
-      console.log(`[LIVE] Order response:`, JSON.stringify(response, null, 2));
-
-      if (!response || !response.success) {
-        // Record failure BEFORE returning — structured API rejections must count
-        this.circuitBreaker.recordFailure();
-        const errorMsg = response?.errorMsg || "Unknown error from CLOB API";
-        console.error(`[LIVE] Order rejected: ${errorMsg}`);
-        return {
-          orderId,
-          status: "failed",
-          filledSize: 0,
-          error: errorMsg,
-          placedAt,
-          executedAt,
-          executionMode: "live",
-          orderType: order.orderType,
-        };
-      }
-
-      this.circuitBreaker.recordSuccess();
-
-      const clobOrderId = response.orderID || orderId;
-      const status = response.status || "live";
-
-      // Determine fill status
-      if (status === "matched") {
-        // Fully filled immediately
-        const filledSize = order.size;
-        const fillPrice = order.price;
-
-        // Slippage check for immediate fills
-        const slippage = checkSlippage(order.side, order.price, fillPrice, this.config.maxSlippageBps ?? 200);
-        if (!slippage.acceptable) {
-          console.warn(`[LIVE] ${slippage.description}`);
-          // Log warning but don't reject — the fill already happened on-chain
-        }
-
-        this.trackPosition(order, filledSize, fillPrice);
-
-        return {
-          orderId: clobOrderId,
-          status: "filled",
-          filledSize,
-          avgFillPrice: fillPrice,
-          placedAt,
-          executedAt,
-          executionMode: "live",
-          orderType: order.orderType,
-        };
-      }
-
-      if (status === "live" || status === "delayed" || status === "unmatched") {
-        // Order is resting on the book — poll for fill
-        console.log(`[LIVE] Order ${clobOrderId} is ${status}, polling for fill...`);
-        return await this.pollOrderStatus(clobOrderId, order, placedAt);
-      }
-
-      // Unknown status
-      return {
-        orderId: clobOrderId,
-        status: "pending",
-        filledSize: 0,
-        placedAt,
-        executedAt,
-        executionMode: "live",
-        orderType: order.orderType,
-      };
     } catch (error) {
+      // 3. Handle unexpected errors
       this.circuitBreaker.recordFailure();
       const errorMsg = error instanceof Error ? error.message : String(error);
       console.error(`[LIVE] Order execution failed: ${errorMsg} (circuit breaker: ${this.circuitBreaker.getState()})`);
@@ -362,6 +250,136 @@ export class LiveTradingExecutor implements OrderExecutor {
         orderType: order.orderType,
       };
     }
+  }
+
+  /**
+   * Submit the order to the CLOB API
+   */
+  private async submitOrder(order: OrderSpec): Promise<any> {
+    const side = order.side === "BUY" ? ClobSide.BUY : ClobSide.SELL;
+    const isMarketOrder = order.orderType === "market";
+    const maxRetries = this.config.maxRetries ?? 3;
+
+    if (isMarketOrder) {
+      return withRetry(
+        () => this.client!.createAndPostMarketOrder(
+          {
+            tokenID: order.tokenId,
+            price: order.price,
+            amount: order.side === "BUY" ? order.size * order.price : order.size,
+            side,
+          },
+          undefined,
+          ClobOrderType.FOK,
+        ),
+        { maxRetries },
+      );
+    } else {
+      const orderType = order.expiresInMs && order.expiresInMs > 0
+        ? ClobOrderType.GTD
+        : ClobOrderType.GTC;
+
+      const userOrder: any = {
+        tokenID: order.tokenId,
+        price: order.price,
+        size: order.size,
+        side,
+      };
+
+      if (orderType === ClobOrderType.GTD && order.expiresInMs) {
+        const minExpiration = Math.floor(Date.now() / 1000) + 60;
+        const requestedExpiration = Math.floor((Date.now() + order.expiresInMs) / 1000);
+        userOrder.expiration = Math.max(requestedExpiration, minExpiration);
+      }
+
+      return withRetry(
+        () => this.client!.createAndPostOrder(
+          userOrder,
+          undefined,
+          orderType,
+        ),
+        { maxRetries },
+      );
+    }
+  }
+
+  /**
+   * Handle successful order submission response
+   */
+  private async handleOrderSubmission(
+    response: any,
+    order: OrderSpec,
+    orderId: string,
+    placedAt: Date
+  ): Promise<OrderResult> {
+    const executedAt = new Date();
+    console.log(`[LIVE] Order response:`, JSON.stringify(response, null, 2));
+
+    if (!response || !response.success) {
+      // Record failure BEFORE returning — structured API rejections must count
+      this.circuitBreaker.recordFailure();
+      const errorMsg = response?.errorMsg || "Unknown error from CLOB API";
+      console.error(`[LIVE] Order rejected: ${errorMsg}`);
+      return {
+        orderId,
+        status: "failed",
+        filledSize: 0,
+        error: errorMsg,
+        placedAt,
+        executedAt,
+        executionMode: "live",
+        orderType: order.orderType,
+      };
+    }
+
+    this.circuitBreaker.recordSuccess();
+
+    const clobOrderId = response.orderID || orderId;
+    const status = response.status || "live";
+
+    // Determine fill status
+    if (status === "matched") {
+      // Fully filled immediately
+      const filledSize = order.size;
+      const fillPrice = order.price;
+
+      // Slippage check for immediate fills
+      const slippage = checkSlippage(order.side, order.price, fillPrice, this.config.maxSlippageBps ?? 200);
+      if (!slippage.acceptable) {
+        console.warn(`[LIVE] ${slippage.description}`);
+        // Log warning but don't reject — the fill already happened on-chain
+      }
+
+      this.trackPosition(order, filledSize, fillPrice);
+
+      return {
+        orderId: clobOrderId,
+        status: "filled",
+        filledSize,
+        avgFillPrice: fillPrice,
+        placedAt,
+        executedAt,
+        executionMode: "live",
+        orderType: order.orderType,
+      };
+    }
+
+    if (status === "live" || status === "delayed" || status === "unmatched") {
+      // Order is resting on the book — poll for fill
+      console.log(`[LIVE] Order ${clobOrderId} is ${status}, polling for fill...`);
+      return await this.pollOrderStatus(clobOrderId, order, placedAt);
+    }
+
+    // Unknown status
+    return {
+      orderId: clobOrderId,
+      status: "pending",
+      filledSize: 0,
+      placedAt,
+      executedAt,
+      executionMode: "live",
+      orderType: order.orderType,
+    };
   }
 
   /**

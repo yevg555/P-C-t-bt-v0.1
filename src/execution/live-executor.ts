@@ -23,6 +23,8 @@ import {
   Side as ClobSide,
   OrderType as ClobOrderType,
   AssetType,
+  OrderResponse,
+  UserOrder,
 } from "@polymarket/clob-client";
 import { SignatureType } from "@polymarket/order-utils";
 
@@ -231,7 +233,7 @@ export class LiveTradingExecutor implements OrderExecutor {
 
       // Submit order with retry on transient failures
       const maxRetries = this.config.maxRetries ?? 3;
-      let response: any;
+      let response: OrderResponse | undefined;
 
       if (isMarketOrder) {
         response = await withRetry(
@@ -254,7 +256,7 @@ export class LiveTradingExecutor implements OrderExecutor {
           ? ClobOrderType.GTD
           : ClobOrderType.GTC;
 
-        const userOrder: any = {
+        const userOrder: UserOrder = {
           tokenID: order.tokenId,
           price: order.price,
           size: order.size,
